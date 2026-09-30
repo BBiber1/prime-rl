@@ -7,7 +7,9 @@ import json
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 import grpc
 import torch
@@ -111,6 +113,7 @@ class MXRefitWeightSender(WeightSender):
         self._control: ModelExpressControlClient | None = None
         self._expected_slots: list[str] = []
         self._offer_token: str | None = None
+        self._cycle: telemetry.RefitCycle | None = None
         self._token_message = OfferTokenMessage() if config.handshake_mode == "tensor" else None
 
     @property
@@ -144,29 +147,57 @@ class MXRefitWeightSender(WeightSender):
         self._initialized = True
 
     def _offer(self, step_dir: Path) -> None:
-        """Publish a unique offer token atomically."""
+        """Publish an offer under a native refit-cycle parent."""
+        if self._cycle is not None:
+            self._finish_cycle(RuntimeError("Refit offer superseded before completion"))
         self._offer_token = f"{self.config.run_uid}.{uuid.uuid4().hex[:8]}"
         telemetry.configure("prime-rl-trainer")
+        attributes: dict[str, str | int] = {}
+        carrier: dict[str, str] = {}
         if telemetry.enabled():
-            with telemetry.span(
-                "mx.refit.offer",
-                {
-                    "role": "trainer",
-                    "rank": 0,
-                    "step": step_dir.name,
-                    "experiment": os.environ.get("MX_REFIT_EXPERIMENT", ""),
-                    "staging_mode": os.environ.get("MX_REFIT_STAGING_MODE", ""),
-                },
-            ):
-                carrier: dict[str, str] = {}
-                telemetry.inject(carrier)
-            trace_marker = step_dir / TRACE_CONTEXT_MARKER
-            staged_trace = step_dir / f"{TRACE_CONTEXT_MARKER}.tmp"
-            staged_trace.write_text(json.dumps(carrier))
-            os.replace(staged_trace, trace_marker)
-        staged = step_dir / f"{SENDER_READY_MARKER}.offer"
-        staged.write_text(f"{self._offer_token}\n")
-        os.replace(staged, step_dir / SENDER_READY_MARKER)
+            step = int(step_dir.name.removeprefix("step_"))
+            attributes = {
+                "role": "trainer",
+                "rank": self.world.rank,
+                "step": step,
+                "version_uid": weight_version_uid(self._offer_token, step),
+                "experiment": os.environ.get("MX_REFIT_EXPERIMENT", ""),
+                "staging_mode": os.environ.get("MX_REFIT_STAGING_MODE", self.config.staging_mode),
+                "operation": "refit",
+                "refit.step": step,
+                "refit.phase": "cold" if step == 0 else "warm",
+                "refit.id": weight_version_uid(self._offer_token, step),
+            }
+            self._cycle = telemetry.RefitCycle({**attributes, "refit.root": True})
+            if self._cycle.is_recording():
+                self._cycle.inject(carrier)
+        with self._cycle_errors(), telemetry.extracted(carrier), telemetry.span("mx.refit.offer", attributes):
+            if self._cycle is not None and self._cycle.is_recording():
+                trace_marker = step_dir / TRACE_CONTEXT_MARKER
+                staged_trace = step_dir / f"{TRACE_CONTEXT_MARKER}.tmp"
+                staged_trace.write_text(json.dumps(carrier))
+                os.replace(staged_trace, trace_marker)
+            staged = step_dir / f"{SENDER_READY_MARKER}.offer"
+            staged.write_text(f"{self._offer_token}\n")
+            os.replace(staged, step_dir / SENDER_READY_MARKER)
+
+    @contextmanager
+    def _cycle_errors(self) -> Iterator[None]:
+        try:
+            yield
+        except BaseException as error:
+            self._finish_cycle(error)
+            raise
+
+    def _finish_cycle(self, error: BaseException | None = None) -> None:
+        if self._cycle is not None:
+            self._cycle.finish(error)
+            self._cycle = None
+
+    def _clean(self, step: int) -> None:
+        with self._cycle_errors():
+            super()._clean(step)
+        self._finish_cycle()
 
     def _wait_for_receiver_ready(self, step_dir: Path) -> None:
         # ModelExpress stages versions asynchronously. _wait_released provides
@@ -175,10 +206,14 @@ class MXRefitWeightSender(WeightSender):
 
     @torch.no_grad()
     def _broadcast(self, model: nn.Module, step: int, step_dir: Path) -> None:
-        parent = _read_trace_context(step_dir, self.config.timeout)
-        with timed_refit(
-            "trainer", step, weight_version_uid(self._offer_token or "", step), rank=self.world.rank, parent=parent
-        ) as timer:
+        with self._cycle_errors():
+            parent = _read_trace_context(step_dir, self.config.timeout)
+        with (
+            self._cycle_errors(),
+            timed_refit(
+                "trainer", step, weight_version_uid(self._offer_token or "", step), rank=self.world.rank, parent=parent
+            ) as timer,
+        ):
             timer.mark("rank", self.world.rank)
             timer.mark("handshake_tensor_mode", float(self.config.handshake_mode == "tensor"))
             timer.mark("handshake_barrier_enabled", float(self.config.handshake_barrier))
@@ -268,6 +303,11 @@ class MXRefitWeightSender(WeightSender):
                             "request timed out while it was still reading."
                         ) from error
                     raise
+            recording = timer.trace_span is not None and timer.trace_span.is_recording()
+        if recording:
+            # Close every trainer's role span before the master ends the cycle.
+            with self._cycle_errors():
+                dist.barrier()
 
     def _wait_released(self, uid: str, timer: PhaseTimer | None = None) -> None:
         assert self._control is not None

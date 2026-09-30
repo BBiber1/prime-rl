@@ -270,6 +270,17 @@ MX client carries W3C trace context across their refit calls. Spans include
 `role`, `rank`, experiment and trainer staging mode attributes. PrimeRL does not
 start or configure a receiver.
 
+The trainer master starts a native `mx.refit.cycle` before publishing the offer
+and ends it after all trainer role spans have closed and the broadcast is committed.
+`mx.refit.offer` remains a separate child. The shared W3C carrier contains the cycle's
+context, so trainer and control role roots are siblings under it; generator and
+server spans inherit that trace through the existing HTTP/gRPC propagation.
+The stable name supports comparison; experiment, numeric step, cold/warm phase,
+version UID, role and rank are attributes. Recording traces adds a completion
+barrier after the trainer role spans close. Disabled tracing skips that collective
+and trace markers. Failure in an MX hook ends the parent with an error.
+Collector and UI configuration remain external to PrimeRL and ModelExpress.
+
 #### Installing ModelExpress
 
 ModelExpress is installed separately from PrimeRL. Both `nixl` and `mx_refit` require it; other transports can run without it. Selecting either MX transport checks the required client APIs at startup and reports a missing or incompatible installation. There is no released `mx` extra for the refit APIs yet.
