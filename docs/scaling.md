@@ -263,6 +263,13 @@ By default, the trainer and inference worker each allocate one transfer arena. S
 
 Set `[weight_broadcast] type = "mx_refit"` to have ModelExpress reshard the weights rather than transferring them rank-to-rank. The trainer publishes each rank's FSDP shard under a per-step version and inference pulls the slices it needs, so the two sides do not have to agree on a parallelism layout.
 
+To export refit traces and metrics, set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to an external OTLP HTTP receiver before
+launching the trainer, inference, control process and ModelExpress server. The
+MX client carries W3C trace context across their refit calls. Spans include
+`role`, `rank`, experiment and trainer staging mode attributes. PrimeRL does not
+start or configure a receiver.
+
 #### Installing ModelExpress
 
 ModelExpress is installed separately from PrimeRL. Both `nixl` and `mx_refit` require it; other transports can run without it. Selecting either MX transport checks the required client APIs at startup and reports a missing or incompatible installation. There is no released `mx` extra for the refit APIs yet.

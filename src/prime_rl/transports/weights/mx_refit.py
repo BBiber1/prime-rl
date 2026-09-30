@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -12,6 +13,7 @@ import grpc
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from modelexpress import telemetry
 from modelexpress_rl import (
     FSDPTrainerContext,
     ModelExpressControlClient,
@@ -28,11 +30,25 @@ from prime_rl.orchestrator.clients import init_mx_refit_broadcast
 from prime_rl.trainer.parallel_dims import ParallelDims
 from prime_rl.transports.weights.base import SENDER_READY_MARKER, WeightReceiver, WeightSender
 from prime_rl.transports.weights.mx_phases import PhaseTimer, timed_refit
+from prime_rl.utils.mx_compat import require_mx_refit
 from prime_rl.utils.mx_handshake import OfferTokenMessage
 from prime_rl.utils.mx_precision import build_trainer_context
 
 RELEASE_POLL_INTERVAL = 0.05
 READY_POLL_INTERVAL = 0.1
+TRACE_CONTEXT_MARKER = ".trace_context.json"
+
+
+def _read_trace_context(step_dir: Path, timeout: float) -> dict[str, str] | None:
+    if not telemetry.enabled():
+        return None
+    marker = step_dir / TRACE_CONTEXT_MARKER
+    deadline = time.monotonic() + timeout
+    while not marker.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"No refit trace context at {marker} within {timeout}s")
+        time.sleep(0.05)
+    return json.loads(marker.read_text())
 
 
 def weight_version_uid(offer_token: str, step: int) -> str:
@@ -41,7 +57,7 @@ def weight_version_uid(offer_token: str, step: int) -> str:
 
 
 def version_missing(error: grpc.RpcError) -> bool:
-    """Whether the control plane reports that the version is absent."""
+    """Whether ``error`` means the trainer has not created the version yet."""
     return error.code() is grpc.StatusCode.NOT_FOUND
 
 
@@ -102,7 +118,9 @@ class MXRefitWeightSender(WeightSender):
         return f"{self.config.host}:{self.config.port}"
 
     def _initialize(self, model: nn.Module) -> None:
+        require_mx_refit(staging_mode=self.config.staging_mode)
         tensors = model.state_dict()
+        # Publishers stay unpinned because every receiver reads from every rank.
         self._client = ModelExpressTrainerClient.initialize(
             ModelExpressTrainerConfig(
                 engine_context=build_trainer_context(FSDPTrainerContext, model, tensors),
@@ -128,19 +146,39 @@ class MXRefitWeightSender(WeightSender):
     def _offer(self, step_dir: Path) -> None:
         """Publish a unique offer token atomically."""
         self._offer_token = f"{self.config.run_uid}.{uuid.uuid4().hex[:8]}"
+        telemetry.configure("prime-rl-trainer")
+        if telemetry.enabled():
+            with telemetry.span(
+                "mx.refit.offer",
+                {
+                    "role": "trainer",
+                    "rank": 0,
+                    "step": step_dir.name,
+                    "experiment": os.environ.get("MX_REFIT_EXPERIMENT", ""),
+                    "staging_mode": os.environ.get("MX_REFIT_STAGING_MODE", ""),
+                },
+            ):
+                carrier: dict[str, str] = {}
+                telemetry.inject(carrier)
+            trace_marker = step_dir / TRACE_CONTEXT_MARKER
+            staged_trace = step_dir / f"{TRACE_CONTEXT_MARKER}.tmp"
+            staged_trace.write_text(json.dumps(carrier))
+            os.replace(staged_trace, trace_marker)
         staged = step_dir / f"{SENDER_READY_MARKER}.offer"
         staged.write_text(f"{self._offer_token}\n")
         os.replace(staged, step_dir / SENDER_READY_MARKER)
 
     def _wait_for_receiver_ready(self, step_dir: Path) -> None:
-        # Publication can start before the receiver is ready. _wait_released
-        # waits for version retirement; retirement also happens after failures.
+        # ModelExpress stages versions asynchronously. _wait_released provides
+        # the stronger guarantee that a generator consumed the version.
         del step_dir
 
     @torch.no_grad()
     def _broadcast(self, model: nn.Module, step: int, step_dir: Path) -> None:
-        del step_dir  # mx_refit addresses versions by uid, not by path
-        with timed_refit("trainer", step, weight_version_uid(self._offer_token or "", step)) as timer:
+        parent = _read_trace_context(step_dir, self.config.timeout)
+        with timed_refit(
+            "trainer", step, weight_version_uid(self._offer_token or "", step), rank=self.world.rank, parent=parent
+        ) as timer:
             timer.mark("rank", self.world.rank)
             timer.mark("handshake_tensor_mode", float(self.config.handshake_mode == "tensor"))
             timer.mark("handshake_barrier_enabled", float(self.config.handshake_barrier))
@@ -210,9 +248,6 @@ class MXRefitWeightSender(WeightSender):
                     dist.barrier()
                 with timer.child("publish_client_s"):
                     self._client.publish_version(version=WeightVersionRef(uid))
-                with timer.child("publish_metrics_s"):
-                    for name, value in self._client.pop_metrics().items():
-                        timer.mark(name, float(value))
 
             with timer.phase("rendezvous"):
                 if self.world.is_master:
@@ -249,14 +284,17 @@ class MXRefitWeightSender(WeightSender):
                     state = self._control.get_weight_version(uid).state
                 except grpc.RpcError as error:
                     if version_missing(error):
-                        # An observed version disappearing confirms retirement,
-                        # not installation success. Without a prior observation,
-                        # we cannot distinguish retirement from a missing publish.
+                        # NOT_FOUND after we have seen the version means a
+                        # generator consumed and retired it. NOT_FOUND before
+                        # that means it never existed -- a failed publish or a
+                        # uid mismatch between the two sides -- and reporting a
+                        # successful broadcast would credit weights that were
+                        # never transferred.
                         if observed:
                             return
                         raise RuntimeError(
                             f"Version {uid} was not visible to the control plane on any poll, "
-                            "so retirement could not be confirmed and the broadcast cannot be "
+                            "so no consumption was observed and the broadcast cannot be "
                             "reported as released. Check that the publish landed and that "
                             "both sides agree on the run identity."
                         ) from error
@@ -269,9 +307,10 @@ class MXRefitWeightSender(WeightSender):
                     return
                 if time.monotonic() > deadline:
                     raise TimeoutError(
-                        f"Version {uid} was not retired within {self.timeout}s (state={state}). "
+                        f"No generator pulled version {uid} within {self.timeout}s (state={state}). "
                         + (
-                            "Check inference update progress and whether both sides are on the same step."
+                            "The consumer is not looking for this step; if only one side restarted, "
+                            "restart both so they resync to the same step."
                             if state is WeightVersionState.READY
                             else "Not every trainer rank published its shard."
                         )
@@ -307,7 +346,8 @@ class MXRefitWeightReceiver(WeightReceiver):
 
     async def receive(self, step: int) -> None:
         assert self._control is not None
-        with timed_refit("orchestrator", step, "") as timer:
+        parent = await asyncio.to_thread(_read_trace_context, self.step_dir(step), self.config.timeout)
+        with timed_refit("orchestrator", step, "", parent=parent) as timer:
             timer.mark("rank", 0)
             self._mark_offer_lag(step, timer)
             self._ack(step)

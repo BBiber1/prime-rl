@@ -5,16 +5,14 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("modelexpress_rl")
-
-from prime_rl.configs.trainer import MXRefitWeightBroadcastConfig  # noqa: E402
-from prime_rl.transports.weights.base import SENDER_READY_MARKER  # noqa: E402
-from prime_rl.transports.weights.mx_refit import (  # noqa: E402
+from prime_rl.configs.trainer import MXRefitWeightBroadcastConfig
+from prime_rl.transports.weights.base import SENDER_READY_MARKER
+from prime_rl.transports.weights.mx_refit import (
     MXRefitWeightReceiver,
     MXRefitWeightSender,
     weight_version_uid,
 )
-from prime_rl.utils.pathing import get_broadcast_dir  # noqa: E402
+from prime_rl.utils.pathing import get_broadcast_dir
 
 RUN_UID = "testrun"
 

@@ -5,15 +5,14 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+from modelexpress_rl import WeightVersionState
 
-modelexpress_rl = pytest.importorskip("modelexpress_rl")
-
-import prime_rl.transports.weights.mx_refit as mx_refit  # noqa: E402
-from prime_rl.configs.trainer import MXRefitWeightBroadcastConfig  # noqa: E402
-from prime_rl.transports.weights.base import SENDER_READY_MARKER  # noqa: E402
-from prime_rl.transports.weights.mx_phases import PhaseTimer  # noqa: E402
-from prime_rl.transports.weights.mx_refit import MXRefitWeightReceiver, MXRefitWeightSender  # noqa: E402
-from prime_rl.utils.pathing import get_broadcast_dir  # noqa: E402
+import prime_rl.transports.weights.mx_refit as mx_refit
+from prime_rl.configs.trainer import MXRefitWeightBroadcastConfig
+from prime_rl.transports.weights.base import SENDER_READY_MARKER
+from prime_rl.transports.weights.mx_phases import PhaseTimer
+from prime_rl.transports.weights.mx_refit import MXRefitWeightReceiver, MXRefitWeightSender
+from prime_rl.utils.pathing import get_broadcast_dir
 
 
 class ControlClient:
@@ -21,7 +20,7 @@ class ControlClient:
         self.deleted: list[str] = []
 
     def get_weight_version(self, uid: str):
-        return SimpleNamespace(state=modelexpress_rl.WeightVersionState.READY)
+        return SimpleNamespace(state=WeightVersionState.READY)
 
     def delete_weight_version(self, uid: str) -> None:
         self.deleted.append(uid)
@@ -44,7 +43,7 @@ def test_rendezvous_wait_is_bounded(tmp_path):
     sender = MXRefitWeightSender(tmp_path, config, parallel_dims=None, model_name="model")
     sender._control = ControlClient()
 
-    with pytest.raises(TimeoutError, match="was not retired"):
+    with pytest.raises(TimeoutError, match="No generator pulled"):
         sender._wait_released("run.token:1")
 
 

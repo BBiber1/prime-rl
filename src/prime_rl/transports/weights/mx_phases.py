@@ -10,14 +10,17 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
+from modelexpress import telemetry
+
 RECORD = "mx-refit-phases-v1"
 
 
 class PhaseTimer:
     """Accumulates named phase durations for one refit and emits them once."""
 
-    def __init__(self, role: str, step: int, version_uid: str) -> None:
+    def __init__(self, role: str, step: int, version_uid: str, rank: int = 0) -> None:
         self.role = role
+        self.rank = rank
         self.step = step
         self.version_uid = version_uid
         self.phases: dict[str, float] = {}
@@ -28,52 +31,83 @@ class PhaseTimer:
         self.started = time.perf_counter()
         self.elapsed: float | None = None
         self.status = "running"
+        self.trace_span = None
+
+    @property
+    def trace_attributes(self) -> dict[str, str | int]:
+        attributes: dict[str, str | int] = {
+            "role": "control" if self.role == "orchestrator" else self.role,
+            "rank": self.rank,
+            "step": self.step,
+            "version_uid": self.version_uid,
+        }
+        for attribute, variable in (("experiment", "MX_REFIT_EXPERIMENT"), ("staging_mode", "MX_REFIT_STAGING_MODE")):
+            if value := os.environ.get(variable):
+                attributes[attribute] = value
+        return attributes
+
+    @property
+    def metric_attributes(self) -> dict[str, str | int]:
+        return {key: value for key, value in self.trace_attributes.items() if key not in ("step", "version_uid")}
 
     def identify(self, version_uid: str) -> None:
-        """Set the version ID once the offer token is known."""
+        """Set the version ID after discovery."""
         self.version_uid = version_uid
+        if self.trace_span is not None and self.trace_span.is_recording():
+            self.trace_span.set_attribute("version_uid", version_uid)
 
     def mark(self, name: str, value: float) -> None:
         """Record a value that is not part of accounted phase time."""
         self.marks[name] = value
+        if self.trace_span is not None and self.trace_span.is_recording():
+            self.trace_span.set_attribute(f"mx.mark.{name}", value)
 
     @contextmanager
     def phase(self, name: str, *, timeline: bool = False) -> Iterator[None]:
         started = time.perf_counter()
         first_span = len(self.spans)
         completed = False
-        try:
-            yield
-            completed = True
-        finally:
-            ended = time.perf_counter()
-            self.phases[name] = self.phases.get(name, 0.0) + (ended - started)
-            if timeline:
-                children = self.spans[first_span:]
-                parent = self._record_span(name, started, ended, completed)
-                self._record_gaps(parent, children)
+        with telemetry.span(f"mx.refit.{name}", self.trace_attributes):
+            try:
+                yield
+                completed = True
+            finally:
+                ended = time.perf_counter()
+                elapsed = ended - started
+                self.phases[name] = self.phases.get(name, 0.0) + elapsed
+                telemetry.duration(
+                    "mx_refit_phase_duration_seconds",
+                    elapsed,
+                    {**self.metric_attributes, "phase": name, "status": "complete" if completed else "failed"},
+                )
+                if timeline:
+                    children = self.spans[first_span:]
+                    parent = self._record_span(name, started, ended, completed)
+                    self._record_gaps(parent, children)
 
     @contextmanager
     def child(self, name: str) -> Iterator[None]:
         """Time a nested operation without counting it again in accounted time."""
         started = time.perf_counter()
-        try:
-            yield
-        finally:
-            self.marks[name] = self.marks.get(name, 0.0) + (time.perf_counter() - started)
+        with telemetry.span(f"mx.refit.{name}", self.trace_attributes):
+            try:
+                yield
+            finally:
+                self.marks[name] = self.marks.get(name, 0.0) + (time.perf_counter() - started)
 
     @contextmanager
     def span(self, name: str) -> Iterator[None]:
         """Record a child interval, including failed/cancelled calls, on this timer's clock."""
         started = time.perf_counter()
         completed = False
-        try:
-            yield
-            completed = True
-        finally:
-            ended = time.perf_counter()
-            self.marks[f"{name}_s"] = self.marks.get(f"{name}_s", 0.0) + ended - started
-            self._record_span(name, started, ended, completed)
+        with telemetry.span(f"mx.refit.{name}", self.trace_attributes):
+            try:
+                yield
+                completed = True
+            finally:
+                ended = time.perf_counter()
+                self.marks[f"{name}_s"] = self.marks.get(f"{name}_s", 0.0) + ended - started
+                self._record_span(name, started, ended, completed)
 
     def _record_span(self, name: str, started: float, ended: float, completed: bool) -> dict:
         span = {
@@ -151,16 +185,30 @@ class PhaseTimer:
 
 
 @contextmanager
-def timed_refit(role: str, step: int, version_uid: str) -> Iterator[PhaseTimer]:
+def timed_refit(
+    role: str, step: int, version_uid: str, *, rank: int = 0, parent: dict[str, str] | None = None
+) -> Iterator[PhaseTimer]:
     """Time one refit cycle for ``role`` and emit the split on the way out."""
-    timer = PhaseTimer(role, step, version_uid)
-    try:
-        yield timer
-    except BaseException:
-        timer.status = "failed"
-        raise
-    else:
-        timer.status = "complete"
-    finally:
-        timer.elapsed = time.perf_counter() - timer.started
-        timer.emit()
+    telemetry.configure(f"prime-rl-{role}")
+    timer = PhaseTimer(role, step, version_uid, rank)
+    with telemetry.extracted(parent or {}):
+        with telemetry.span("mx.refit", timer.trace_attributes) as trace_span:
+            timer.trace_span = trace_span
+            with telemetry.refit_attributes(timer.trace_attributes):
+                try:
+                    yield timer
+                except BaseException:
+                    timer.status = "failed"
+                    raise
+                else:
+                    timer.status = "complete"
+                finally:
+                    timer.elapsed = time.perf_counter() - timer.started
+                    if trace_span.is_recording():
+                        trace_span.set_attribute("status", timer.status)
+                    telemetry.duration(
+                        "mx_refit_total_duration_seconds",
+                        timer.elapsed,
+                        {**timer.metric_attributes, "status": timer.status},
+                    )
+                    timer.emit()

@@ -14,9 +14,20 @@ def wire_dtype_overrides(model: nn.Module, tensors: dict[str, torch.Tensor]) -> 
 
 
 def build_trainer_context(context_cls, model: nn.Module, tensors: dict[str, torch.Tensor]):
-    """Build a trainer context that preserves required transfer dtypes.
+    """Construct `context_cls`, naming wire-dtype overrides only if it accepts them.
 
-    Reject clients that cannot represent the model's FP32 overrides.
+    `FSDPTrainerContext` grew `wire_dtype_overrides` after the released client,
+    so naming it unconditionally makes the refit transport require an unreleased
+    ModelExpress from every model -- including the ones that ask for no
+    overrides at all, which is most of them.
+
+    A model that does ask for them is a different matter. Transferring a tensor
+    at BF16 when the model declared it needs FP32 loses bits silently and
+    surfaces much later as a diverged policy, so an override the client cannot
+    carry has to stop the run rather than warn.
+
+    Takes the class as an argument rather than importing it so this stays
+    testable, and usable, without the ModelExpress client installed.
     """
     overrides = wire_dtype_overrides(model, tensors)
     if "wire_dtype_overrides" in inspect.signature(context_cls).parameters:

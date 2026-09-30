@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import sys
 from collections.abc import Callable
 from contextlib import nullcontext
 from pathlib import Path
@@ -219,19 +221,48 @@ class AdminPlane:
         """Update every inference engine through its configured weight transport."""
         weight_dir_posix = weight_dir.as_posix() if weight_dir is not None else None
         span = phase_timer.span if phase_timer is not None else lambda _: nullcontext()
+        verify_initial = transport == "mx_refit" and step == 0 and os.environ.get("MX_VERIFY_INITIAL_REFIT") == "1"
+        if phase_timer is not None:
+            phase_timer.mark("admin_initial_verification_enabled", int(verify_initial))
+        before = None
+        if verify_initial:
+            with span("admin_initial_generation_before"):
+                before = await self._mx_generation_control()
+
         await _pause_engines(self.clients, step=step, phase_timer=phase_timer)
         updated = False
         try:
             if on_paused is not None:
                 with span("admin_on_paused"):
                     on_paused()
+            if verify_initial:
+                with span("admin_initial_prepare"):
+                    await _gather_every_replica(
+                        [
+                            _admin_post(
+                                client,
+                                "/mx_prepare_initial_refit",
+                                timeout_s=UPDATE_WEIGHTS_TIMEOUT_S,
+                                retry_errors=False,
+                            )
+                            for client in self.clients
+                        ],
+                        operation="initial refit preparation",
+                    )
             with span("admin_update"):
+                mx_headers = None
+                if transport == "mx_refit":
+                    from modelexpress import telemetry
+
+                    mx_headers = {}
+                    telemetry.inject(mx_headers)
                 await _gather_every_replica(
                     [
                         _admin_post(
                             admin_client,
                             "/update_weights",
                             json={"weight_dir": weight_dir_posix, "version_uid": version_uid},
+                            **({"headers": mx_headers} if mx_headers else {}),
                             timeout_s=UPDATE_WEIGHTS_TIMEOUT_S,
                             retry_errors=transport != "mx_refit",
                         )
@@ -244,13 +275,47 @@ class AdminPlane:
             if updated or transport != "mx_refit":
                 await _resume_engines(self.clients, phase_timer=phase_timer)
             else:
-                # DIRECT updates can partially change live weights; keep engines
-                # paused on failure.
+                # A failed mx_refit update can leave weights partially installed,
+                # so resuming would serve a mix of versions. Staying paused is
+                # deliberate, but it must not be silent: the trainer is released
+                # by the receiver's own cleanup and would otherwise advance while
+                # inference never serves again.
                 get_logger().error(
                     "mx_refit weight update failed; inference engines remain paused to avoid "
                     "serving partially installed weights. Restart the trainer and inference "
                     "together to recover."
                 )
+        if verify_initial:
+            try:
+                with span("admin_initial_generation_after"):
+                    after = await self._mx_generation_control()
+                replicas = [item["replica"] for item in after]
+                passed = before == after and sorted(replicas) == list(range(len(self.clients)))
+                record = {
+                    "record": "mx-initial-generation-control-v1",
+                    "passed": passed,
+                    "replicas": len(self.clients),
+                    "version_uid": version_uid,
+                    "before": before,
+                    "after": after,
+                }
+                sys.stdout.write(json.dumps(record) + "\n")
+                sys.stdout.flush()
+                if not passed:
+                    raise RuntimeError("Initial greedy generation changed after refit; restart the engines")
+            except BaseException:
+                await _pause_engines(
+                    self.clients, step=step, phase_timer=phase_timer, span_name="admin_initial_recovery_pause"
+                )
+                raise
+
+    async def _mx_generation_control(self) -> list[dict]:
+        async def control(client):
+            response = await client.post("/mx_generation_control", timeout=UPDATE_WEIGHTS_TIMEOUT_S)
+            response.raise_for_status()
+            return response.json()
+
+        return await asyncio.gather(*(control(client) for client in self.clients))
 
     async def aclose(self) -> None:
         for client in self.clients + self._router_clients:
