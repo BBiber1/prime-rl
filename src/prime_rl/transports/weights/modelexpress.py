@@ -2,7 +2,6 @@
 
 import asyncio
 import atexit
-import json
 import os
 import time
 import uuid
@@ -147,32 +146,42 @@ class ModelExpressWeightSender(WeightSender):
     @torch.no_grad()
     def _broadcast(self, model: nn.Module, step: int, step_dir: Path) -> None:
         try:
-            if not self.world.is_master:
+            initialized = None
+            if self.world.is_master:
+                with self._role.active(), telemetry.refit_attributes(self._attributes(step), role="trainer", rank=0):
+                    if self._trainer is None:
+                        with telemetry.span("mx.refit.trainer_initialize"):
+                            self._initialize(model)
+                    version = self._offer_version(step, step_dir)
+            else:
                 telemetry.configure("prime-rl-trainer")
+                version = None
+                if self._trainer is None:
+                    start = time.time_ns()
+                    with telemetry.untraced():
+                        self._initialize(model)
+                    initialized = (start, time.time_ns())
+            broadcast_start = time.time_ns()
+            offered = [version, self._carrier, self._trainer_carrier]
+            dist.broadcast_object_list(offered, src=0)
+            self._uid, self._carrier, self._trainer_carrier = offered
+            broadcast_end = time.time_ns()
+            if not self.world.is_master:
                 self._role = telemetry.RefitCycle(
-                    {**self._attributes(step), "role": "trainer", "rank": self.world.rank},
+                    {**self._attributes(step, self._uid), "role": "trainer", "rank": self.world.rank},
                     name="mx.refit.trainer",
-                    parent={},
+                    parent=self._trainer_carrier,
                 )
+            attributes = {"version_uid": self._uid, "refit.id": self._uid}
+            self._role.set_attributes(attributes)
             with (
                 self._role.active(),
-                telemetry.refit_attributes(self._attributes(step), role="trainer", rank=self.world.rank),
+                telemetry.refit_attributes(self._attributes(step, self._uid), role="trainer", rank=self.world.rank),
             ):
-                if self._trainer is None:
-                    with telemetry.span("mx.refit.trainer_initialize"):
-                        self._initialize(model)
-                broadcast_start = time.time_ns()
-                version = self._offer_version(step, step_dir)
-                offered = [version, self._carrier, self._trainer_carrier]
-                dist.broadcast_object_list(offered, src=0)
-                self._uid, self._carrier, self._trainer_carrier = offered
-                attributes = {"version_uid": self._uid, "refit.id": self._uid}
-                if not self.world.is_master and self._trainer_carrier.get("traceparent"):
-                    self._role.set_attributes({"refit.parent": self._trainer_carrier["traceparent"]})
-                self._role.set_attributes(attributes)
-                with telemetry.refit_attributes(attributes):
-                    telemetry.completed_span("mx.refit.version_broadcast", broadcast_start, time.time_ns())
-                    self._publish_and_wait(step, step_dir)
+                if initialized is not None:
+                    telemetry.completed_span("mx.refit.trainer_initialize", *initialized)
+                telemetry.completed_span("mx.refit.version_broadcast", broadcast_start, broadcast_end)
+                self._publish_and_wait(step, step_dir)
             if not self.world.is_master:
                 self._role.finish()
         except BaseException as error:
@@ -197,7 +206,7 @@ class ModelExpressWeightSender(WeightSender):
             with telemetry.span("mx.refit.version_marker_publish", attributes):
                 marker = step_dir / VERSION_MARKER
                 pending = marker.with_suffix(".pending")
-                pending.write_text(json.dumps({"version_uid": uid}))
+                pending.write_text(uid)
                 pending.replace(marker)
             return uid
         return None
@@ -248,24 +257,29 @@ class ModelExpressWeightReceiver(WeightReceiver):
             "staging_mode": self.config.staging_mode,
             "refit.aggregate": True,
         }
-        with (
-            telemetry.refit_attributes(attributes, role="orchestrator", rank=0),
-            telemetry.refit_span("mx.refit.orchestrator", parent={}) as orchestrator,
-        ):
-            with telemetry.span("mx.refit.receiver_ack"):
-                self._ack(step)
-            marker = self.step_dir(step) / VERSION_MARKER
-            with telemetry.span("mx.refit.wait_version_marker", {"wait.marker": str(marker)}):
-                await asyncio.wait_for(wait_for_path(marker, interval=0.01), timeout=self.config.timeout)
-                uid = json.loads(marker.read_text())["version_uid"]
+        ack_start = time.time_ns()
+        self._ack(step)
+        ack_end = time.time_ns()
+        marker = self.step_dir(step) / VERSION_MARKER
+        wait_start = time.time_ns()
+        await asyncio.wait_for(wait_for_path(marker, interval=0.01), timeout=self.config.timeout)
+        uid = marker.read_text()
+        wait_end = time.time_ns()
+        lookup_start = time.time_ns()
+        with telemetry.untraced():
             version = await asyncio.to_thread(self._control.get_weight_version, uid)
-            carrier = version.trace_context
-            attributes = {"version_uid": uid, "refit.id": uid}
-            if carrier.get("traceparent"):
-                orchestrator.set_attributes({"refit.parent": carrier["traceparent"]})
-            orchestrator.set_attributes(attributes)
-            with telemetry.extracted(carrier), orchestrator.active(), telemetry.refit_attributes(attributes):
-                await self._receive_version(step, uid, carrier, version)
+        lookup_end = time.time_ns()
+        carrier = version.trace_context
+        attributes.update({"version_uid": uid, "refit.id": uid})
+        with (
+            telemetry.extracted(carrier),
+            telemetry.refit_attributes(attributes, role="orchestrator", rank=0),
+            telemetry.refit_span("mx.refit.orchestrator"),
+        ):
+            telemetry.completed_span("mx.refit.receiver_ack", ack_start, ack_end)
+            telemetry.completed_span("mx.refit.wait_version_marker", wait_start, wait_end, {"wait.marker": str(marker)})
+            telemetry.completed_span("mx.refit.version_context_lookup", lookup_start, lookup_end)
+            await self._receive_version(step, uid, carrier, version)
 
     async def _receive_version(self, step: int, uid: str, carrier: dict, version) -> None:
         deadline = time.monotonic() + self.config.timeout
