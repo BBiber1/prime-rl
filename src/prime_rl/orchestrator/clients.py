@@ -218,9 +218,10 @@ class AdminPlane:
         async with self._modelexpress_lock:
             if not version_uid:
                 raise ValueError("modelexpress requires version_uid")
-            await _pause_engines(self.clients, step=step)
-            if on_paused is not None:
-                on_paused()
+            with telemetry.span("mx.refit.pause_engines"):
+                await _pause_engines(self.clients, step=step)
+                if on_paused is not None:
+                    on_paused()
 
             async def install(client):
                 carrier = {}
@@ -237,7 +238,8 @@ class AdminPlane:
             for result in results:
                 if isinstance(result, BaseException):
                     raise result
-            await _resume_engines(self.clients)
+            with telemetry.span("mx.refit.resume_engines"):
+                await _resume_engines(self.clients)
 
     async def initialize_modelexpress(
         self,
@@ -457,13 +459,9 @@ async def _pause_engines(admin_clients: list[AsyncClient], *, step: int) -> None
     """Pause all inference engines, waiting for in-flight requests to drain."""
     logger = get_logger()
     logger.debug(f"Pausing inference engines to update weights to policy v{step}")
-    with telemetry.span("mx.refit.pause_engines"):
-        await asyncio.gather(
-            *[
-                _admin_post(client, "/pause", params={"mode": "keep", "clear_cache": "false"})
-                for client in admin_clients
-            ]
-        )
+    await asyncio.gather(
+        *[_admin_post(client, "/pause", params={"mode": "keep", "clear_cache": "false"}) for client in admin_clients]
+    )
     logger.debug("All inference engines paused")
 
 
@@ -474,8 +472,7 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
     failures is safe; a dropped /resume would leave engines paused indefinitely.
     """
     logger = get_logger()
-    with telemetry.span("mx.refit.resume_engines"):
-        await asyncio.gather(*[_admin_post(client, "/resume") for client in admin_clients])
+    await asyncio.gather(*[_admin_post(client, "/resume") for client in admin_clients])
     logger.debug("All inference engines resumed")
 
 
