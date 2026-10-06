@@ -446,6 +446,8 @@ class RLConfig(BaseConfig):
                 if extra.get("speculative_config") is not None:
                     raise ValueError("modelexpress does not support speculative decoding.")
         update = {}
+        if self.weight_broadcast.type == "modelexpress":
+            update["model_name"] = self.trainer.model.name
         if self.weight_broadcast.type != "filesystem":
             update["inference_world_size"] = (
                 self.inference.vllm.data_parallel_size * self.inference.vllm.tensor_parallel_size
