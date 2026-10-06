@@ -29,7 +29,6 @@ from prime_rl.utils.pathing import wait_for_path
 
 VERSION_MARKER = ".mx_version"
 INSTALLED_MARKER = ".installed"
-TRACE_CONTEXT_MARKER = ".trace_context.json"
 
 
 class ModelExpressWeightSender(WeightSender):
@@ -41,21 +40,32 @@ class ModelExpressWeightSender(WeightSender):
         self._control: ModelExpressControlClient | None = None
         self._mesh_id: str | None = None
         self._cycle: telemetry.RefitCycle | None = None
+        self._carrier: dict[str, str] = {}
+
+    def _start_cycle(self, step: int) -> None:
+        telemetry.configure("prime-rl-trainer")
+        self._cycle = None
+        self._carrier = {}
+        if telemetry.enabled():
+            self._cycle = telemetry.RefitCycle({**self._attributes(step), "refit.root": True})
+            self._cycle.inject(self._carrier)
+
+    def _set_cycle(self, step: int) -> None:
+        carrier = [self._carrier]
+        broadcast_start = time.time_ns()
+        dist.broadcast_object_list(carrier, src=0)
+        broadcast_end = time.time_ns()
+        self._carrier = carrier[0]
+        with telemetry.extracted(self._carrier):
+            telemetry.completed_span(
+                "mx.refit.trace_context_broadcast", broadcast_start, broadcast_end, self._attributes(step)
+            )
 
     def _wait_for_receiver_ready(self, step_dir: Path) -> None:
-        telemetry.configure("prime-rl-trainer")
-        carrier = {}
-        if telemetry.enabled():
-            step = int(step_dir.name.removeprefix("step_"))
-            self._cycle = telemetry.RefitCycle({**self._attributes(step), "refit.root": True})
-            carrier = {}
-            self._cycle.inject(carrier)
-            pending = step_dir / (TRACE_CONTEXT_MARKER + ".pending")
-            pending.write_text(json.dumps(carrier))
-            pending.replace(step_dir / TRACE_CONTEXT_MARKER)
         try:
+            self._start_cycle(int(step_dir.name.removeprefix("step_")))
             with (
-                telemetry.extracted(carrier),
+                telemetry.extracted(self._carrier),
                 telemetry.span(
                     "mx.refit.wait_receiver_ready",
                     {
@@ -133,9 +143,8 @@ class ModelExpressWeightSender(WeightSender):
     @torch.no_grad()
     def _broadcast(self, model: nn.Module, step: int, step_dir: Path) -> None:
         try:
-            carrier_path = step_dir / TRACE_CONTEXT_MARKER
-            carrier = json.loads(carrier_path.read_text()) if telemetry.enabled() and carrier_path.exists() else {}
-            with telemetry.extracted(carrier):
+            self._set_cycle(step)
+            with telemetry.extracted(self._carrier), telemetry.refit_attributes(self._attributes(step)):
                 if self._trainer is None:
                     with telemetry.span("mx.refit.trainer_initialize", self._attributes(step)):
                         self._initialize(model)
@@ -163,7 +172,7 @@ class ModelExpressWeightSender(WeightSender):
             with telemetry.span("mx.refit.version_marker_publish", self._attributes(step, version.version_id)):
                 marker = step_dir / VERSION_MARKER
                 pending = marker.with_suffix(".pending")
-                pending.write_text(version.version_id)
+                pending.write_text(json.dumps({"version_uid": version.version_id, "trace_context": offered[1]}))
                 pending.replace(marker)
         with telemetry.span("mx.refit.version_broadcast", self._attributes(step)):
             dist.broadcast_object_list(offered, src=0)
@@ -224,9 +233,9 @@ class ModelExpressWeightReceiver(WeightReceiver):
         marker = self.step_dir(step) / VERSION_MARKER
         await asyncio.wait_for(wait_for_path(marker, interval=0.01), timeout=self.config.timeout)
         marker_visible = time.time_ns()
-        uid = marker.read_text()
-        carrier_path = marker.parent / TRACE_CONTEXT_MARKER
-        carrier = json.loads(carrier_path.read_text()) if telemetry.enabled() and carrier_path.exists() else {}
+        offered = json.loads(marker.read_text())
+        uid = offered["version_uid"]
+        carrier = offered["trace_context"]
         attributes = {
             "role": "orchestrator",
             "rank": 0,

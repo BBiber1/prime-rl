@@ -251,9 +251,10 @@ class AdminPlane:
         if self._modelexpress_failed:
             raise RuntimeError("A ModelExpress update failed; restart trainer and inference before another update")
         self._modelexpress_failed = True
-        await _pause_engines(self.clients, step=step)
-        if on_paused is not None:
-            on_paused()
+        with telemetry.span("mx.refit.pause_engines"):
+            await _pause_engines(self.clients, step=step)
+            if on_paused is not None:
+                on_paused()
 
         async def install(client):
             carrier = {}
@@ -278,7 +279,8 @@ class AdminPlane:
             or any(worker["version_uid"] != version_uid for worker in acknowledgments)
         ):
             raise RuntimeError("Not every inference worker acknowledged the requested weight version")
-        await _resume_engines(self.clients)
+        with telemetry.span("mx.refit.resume_engines"):
+            await _resume_engines(self.clients)
         self._modelexpress_failed = False
 
     async def initialize_modelexpress(
@@ -504,13 +506,9 @@ async def _pause_engines(admin_clients: list[AsyncClient], *, step: int) -> None
     """Pause all inference engines, waiting for in-flight requests to drain."""
     logger = get_logger()
     logger.debug(f"Pausing inference engines to update weights to policy v{step}")
-    with telemetry.span("mx.refit.pause_engines"):
-        await asyncio.gather(
-            *[
-                _admin_post(client, "/pause", params={"mode": "keep", "clear_cache": "false"})
-                for client in admin_clients
-            ]
-        )
+    await asyncio.gather(
+        *[_admin_post(client, "/pause", params={"mode": "keep", "clear_cache": "false"}) for client in admin_clients]
+    )
     logger.debug("All inference engines paused")
 
 
@@ -521,8 +519,7 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
     failures is safe; a dropped /resume would leave engines paused indefinitely.
     """
     logger = get_logger()
-    with telemetry.span("mx.refit.resume_engines"):
-        await asyncio.gather(*[_admin_post(client, "/resume") for client in admin_clients])
+    await asyncio.gather(*[_admin_post(client, "/resume") for client in admin_clients])
     logger.debug("All inference engines resumed")
 
 
