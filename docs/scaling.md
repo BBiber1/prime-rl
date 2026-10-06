@@ -296,6 +296,14 @@ and SFT online evaluation are not supported by this transport. This adapter
 does not reject pipeline parallelism; PrimeRL's bundled deployment sizing and
 worker counts assume TP-only model parallelism, so PP refit is not qualified.
 
+Set standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and optionally
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to export native refit telemetry. A
+`mx.refit.cycle` parent spans the offered update through trainer release; trainer,
+orchestrator, generator, server RPC, transfer, batch and module spans share its
+W3C context. Resource attributes identify the experiment and run. Exporters are
+initialized in each worker process and flushed on shutdown. Without an OTLP
+endpoint, the additional instrumentation is inert.
+
 ### NIXL weight broadcast
 
 Set `[weight_broadcast] type = "nixl"` to use receiver-driven NIXL weight transfer. Before the first SLURM run, install the NIXL/UCX build and the ModelExpress service binaries on the shared filesystem:

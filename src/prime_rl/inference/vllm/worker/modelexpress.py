@@ -1,9 +1,11 @@
 """vLLM extension using the public ModelExpress generator client."""
 
 import atexit
+import os
 from typing import TYPE_CHECKING, cast
 
 import torch
+from modelexpress import telemetry
 from modelexpress_rl import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
@@ -39,7 +41,8 @@ class ModelExpressWeightUpdateWorker(Worker):
 
         hf_config = self.model_runner.model_config.hf_config
         chain = get_custom_causal_lm_cls(hf_config).conversion_chain(hf_config)
-        self._worker_id = f"{session_id}:{rank_offset + self.rank}"
+        self._rank = rank_offset + self.rank
+        self._worker_id = f"{session_id}:{self._rank}"
         self._generator = ModelExpressGeneratorClient.initialize(
             ModelExpressGeneratorConfig(
                 engine_context=VllmGeneratorContext(
@@ -59,13 +62,36 @@ class ModelExpressWeightUpdateWorker(Worker):
         return self._worker_id
 
     @torch.no_grad()
-    def update_weights_from_path(self, weight_dir: str | None = None, version_uid: str | None = None):
+    def update_weights_from_path(
+        self,
+        weight_dir: str | None = None,
+        version_uid: str | None = None,
+        trace_context: dict | None = None,
+        step: int = 0,
+    ):
         if version_uid is None:
             raise ValueError("modelexpress requires version_uid")
-        version = WeightVersionRef(version_uid)
-        staged = self._generator.stage_weight(version=version)
-        try:
-            self._generator.apply_weight(staged)
-        finally:
-            staged.release()
-        return {"worker_id": self._worker_id, "version_uid": version_uid}
+        telemetry.configure("prime-rl-inference")
+        attributes = {
+            "role": "generator",
+            "rank": getattr(self, "_rank", 0),
+            "step": step,
+            "version_uid": version_uid,
+            "refit.id": version_uid,
+            "refit.step": step,
+            "refit.phase": "cold" if step == 0 else "warm",
+            "experiment": os.environ.get("MX_REFIT_EXPERIMENT", ""),
+            "staging_mode": os.environ.get("MX_REFIT_STAGING_MODE", ""),
+        }
+        with (
+            telemetry.extracted(trace_context or {}),
+            telemetry.refit_attributes(attributes),
+            telemetry.span("mx.refit", attributes),
+        ):
+            version = WeightVersionRef(version_uid)
+            staged = self._generator.stage_weight(version=version)
+            try:
+                self._generator.apply_weight(staged)
+            finally:
+                staged.release()
+            return {"worker_id": self._worker_id, "version_uid": version_uid}

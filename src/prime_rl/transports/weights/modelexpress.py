@@ -2,12 +2,15 @@
 
 import asyncio
 import atexit
+import json
+import os
 import time
 import uuid
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from modelexpress import telemetry
 from modelexpress_rl import (
     FSDPTrainerContext,
     ModelExpressControlClient,
@@ -26,6 +29,7 @@ from prime_rl.utils.pathing import wait_for_path
 
 VERSION_MARKER = ".mx_version"
 INSTALLED_MARKER = ".installed"
+TRACE_CONTEXT_MARKER = ".trace_context.json"
 
 
 class ModelExpressWeightSender(WeightSender):
@@ -36,6 +40,50 @@ class ModelExpressWeightSender(WeightSender):
         self._trainer: ModelExpressTrainerClient | None = None
         self._control: ModelExpressControlClient | None = None
         self._mesh_id: str | None = None
+        self._cycle: telemetry.RefitCycle | None = None
+
+    def _wait_for_receiver_ready(self, step_dir: Path) -> None:
+        telemetry.configure("prime-rl-trainer")
+        if telemetry.enabled():
+            step = int(step_dir.name.removeprefix("step_"))
+            self._cycle = telemetry.RefitCycle({**self._attributes(step), "refit.root": True})
+            carrier = {}
+            self._cycle.inject(carrier)
+            pending = step_dir / (TRACE_CONTEXT_MARKER + ".pending")
+            pending.write_text(json.dumps(carrier))
+            pending.replace(step_dir / TRACE_CONTEXT_MARKER)
+        try:
+            super()._wait_for_receiver_ready(step_dir)
+        except BaseException as error:
+            if self._cycle is not None:
+                self._cycle.finish(error)
+            raise
+
+    def _attributes(self, step: int, uid: str = "") -> dict:
+        return {
+            "role": "trainer",
+            "rank": self.world.rank,
+            "step": step,
+            "version_uid": uid,
+            "refit.id": uid,
+            "refit.step": step,
+            "refit.phase": "cold" if step == 0 else "warm",
+            "experiment": os.environ.get("MX_REFIT_EXPERIMENT", ""),
+            "staging_mode": self.config.staging_mode,
+        }
+
+    def _clean(self, step: int) -> None:
+        try:
+            super()._clean(step)
+        except BaseException as error:
+            if self._cycle is not None:
+                self._cycle.finish(error)
+            raise
+        else:
+            if self._cycle is not None:
+                self._cycle.finish()
+        finally:
+            self._cycle = None
 
     def _initialize(self, model: nn.Module) -> None:
         tensors = model.state_dict()
@@ -68,10 +116,22 @@ class ModelExpressWeightSender(WeightSender):
 
     @torch.no_grad()
     def _broadcast(self, model: nn.Module, step: int, step_dir: Path) -> None:
-        if self._trainer is None:
-            self._initialize(model)
+        try:
+            if self._trainer is None:
+                self._initialize(model)
+            assert self._trainer is not None
+            carrier_path = step_dir / TRACE_CONTEXT_MARKER
+            carrier = json.loads(carrier_path.read_text()) if telemetry.enabled() and carrier_path.exists() else {}
+            with telemetry.extracted(carrier):
+                self._publish_and_wait(step, step_dir)
+        except BaseException as error:
+            if self._cycle is not None:
+                self._cycle.finish(error)
+            raise
+
+    def _publish_and_wait(self, step: int, step_dir: Path) -> None:
         assert self._trainer is not None
-        offered = [None]
+        offered = [None, {}]
         if self.world.is_master:
             assert self._control is not None and self._mesh_id is not None
             version = self._control.create_weight_version(
@@ -82,25 +142,36 @@ class ModelExpressWeightSender(WeightSender):
                 version_number=step,
             )
             offered[0] = version.version_id
+            telemetry.inject(offered[1])
             marker = step_dir / VERSION_MARKER
             pending = marker.with_suffix(".pending")
             pending.write_text(version.version_id)
             pending.replace(marker)
         dist.broadcast_object_list(offered, src=0)
         version = WeightVersionRef(offered[0])
-        self._trainer.publish_version(version=version)
+        with (
+            telemetry.extracted(offered[1]),
+            telemetry.refit_attributes(self._attributes(step, version.version_id)),
+            telemetry.span("mx.refit", self._attributes(step, version.version_id)),
+        ):
+            attributes = self._attributes(step, version.version_id)
+            if self._cycle is not None:
+                self._cycle.set_attributes(attributes)
+            with telemetry.span("mx.refit.publish", attributes):
+                self._trainer.publish_version(version=version)
 
-        # Installation acknowledgment is a PrimeRL outcome, not MX retirement.
-        installed = step_dir / INSTALLED_MARKER
-        deadline = time.monotonic() + self.timeout
-        while not installed.exists():
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"Inference did not install version {version.version_id} within {self.timeout}s")
-            time.sleep(0.1)
-        if installed.read_text() != version.version_id:
-            raise RuntimeError("Inference acknowledged a different weight version")
-        self._trainer.release_version(version=version)
-        dist.barrier()
+            # Installation acknowledgment is a PrimeRL outcome, not MX retirement.
+            installed = step_dir / INSTALLED_MARKER
+            deadline = time.monotonic() + self.timeout
+            while not installed.exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Inference did not install version {version.version_id} within {self.timeout}s")
+                time.sleep(0.1)
+            if installed.read_text() != version.version_id:
+                raise RuntimeError("Inference acknowledged a different weight version")
+            with telemetry.span("mx.refit.release", attributes):
+                self._trainer.release_version(version=version)
+            dist.barrier()
 
 
 class ModelExpressWeightReceiver(WeightReceiver):
@@ -121,6 +192,27 @@ class ModelExpressWeightReceiver(WeightReceiver):
         marker = self.step_dir(step) / VERSION_MARKER
         await asyncio.wait_for(wait_for_path(marker, interval=0.01), timeout=self.config.timeout)
         uid = marker.read_text()
+        carrier_path = marker.parent / TRACE_CONTEXT_MARKER
+        carrier = json.loads(carrier_path.read_text()) if telemetry.enabled() and carrier_path.exists() else {}
+        attributes = {
+            "role": "orchestrator",
+            "rank": 0,
+            "step": step,
+            "version_uid": uid,
+            "refit.id": uid,
+            "refit.step": step,
+            "refit.phase": "cold" if step == 0 else "warm",
+            "experiment": os.environ.get("MX_REFIT_EXPERIMENT", ""),
+            "staging_mode": self.config.staging_mode,
+        }
+        with (
+            telemetry.extracted(carrier),
+            telemetry.refit_attributes(attributes),
+            telemetry.span("mx.refit", attributes),
+        ):
+            await self._receive_version(step, uid)
+
+    async def _receive_version(self, step: int, uid: str) -> None:
         deadline = time.monotonic() + self.config.timeout
         while True:
             version = await asyncio.to_thread(self._control.get_weight_version, uid)

@@ -244,6 +244,8 @@ class AdminPlane:
     async def _update_modelexpress_weights(
         self, version_uid: str | None, step: int, on_paused: Callable[[], None] | None
     ) -> None:
+        from modelexpress import telemetry
+
         if version_uid is None or not self._modelexpress_workers:
             raise ValueError("modelexpress requires initialized workers and version_uid")
         if self._modelexpress_failed:
@@ -254,9 +256,12 @@ class AdminPlane:
             on_paused()
 
         async def install(client):
+            carrier = {}
+            telemetry.inject(carrier)
             response = await client.post(
                 "/update_weights",
-                json={"version_uid": version_uid},
+                json={"version_uid": version_uid, "step": step},
+                headers=carrier,
                 timeout=httpx.Timeout(connect=10.0, read=UPDATE_WEIGHTS_TIMEOUT_S, write=60.0, pool=10.0),
             )
             response.raise_for_status()
