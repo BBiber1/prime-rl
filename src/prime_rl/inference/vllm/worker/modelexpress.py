@@ -13,6 +13,8 @@ from modelexpress_rl import (
 )
 from torch import nn
 
+from prime_rl.configs.inference import ModelExpressWeightBroadcastConfig
+
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
 else:
@@ -31,14 +33,15 @@ class ModelExpressWeightUpdateWorker(Worker):
         inference_world_size,
         timeout,
         session_id="default",
-        staging_buffer_bytes=None,
-        staging_buffers_count=1,
     ):
         from prime_rl.trainer.models import get_custom_causal_lm_cls
         from prime_rl.trainer.models.conversion_ops import apply_prime_to_hf
 
         hf_config = self.model_runner.model_config.hf_config
         chain = get_custom_causal_lm_cls(hf_config).conversion_chain(hf_config)
+        config = ModelExpressWeightBroadcastConfig.model_validate(
+            self.vllm_config.additional_config["weight_broadcast"]
+        )
         self._worker_id = f"{session_id}:{rank_offset + self.rank}"
         self._generator = ModelExpressGeneratorClient.initialize(
             ModelExpressGeneratorConfig(
@@ -51,8 +54,8 @@ class ModelExpressWeightUpdateWorker(Worker):
                 server_url=f"{host}:{port}",
                 source_order=(WeightSource.TRAINER,),
                 worker_id=self._worker_id,
-                staging_buffer_bytes=staging_buffer_bytes,
-                staging_buffers_count=staging_buffers_count,
+                staging_buffer_bytes=config.staging_buffer_bytes,
+                staging_buffers_count=config.staging_buffers_count,
             )
         )
         atexit.register(self._generator.close)

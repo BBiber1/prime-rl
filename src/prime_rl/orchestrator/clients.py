@@ -282,8 +282,6 @@ class AdminPlane:
         port: int,
         timeout: int,
         inference_world_size: int,
-        staging_buffer_bytes: int | None,
-        staging_buffers_count: int,
     ) -> None:
         workers_per_server = inference_world_size // len(self.clients)
         if workers_per_server < 1 or inference_world_size % len(self.clients):
@@ -300,8 +298,6 @@ class AdminPlane:
                     "rank_offset": index * workers_per_server,
                     "inference_world_size": inference_world_size,
                     "session_id": session_id,
-                    "staging_buffer_bytes": staging_buffer_bytes,
-                    "staging_buffers_count": staging_buffers_count,
                 },
                 timeout=max(ADMIN_TIMEOUT_S, timeout),
             )

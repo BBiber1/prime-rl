@@ -87,12 +87,6 @@ class ModelExpressWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     staging_mode: Literal["COPY_TO_HOST", "COPY_TO_DEVICE", "IN_PLACE"] = "COPY_TO_HOST"
     """Trainer storage policy passed to ModelExpress."""
 
-    staging_buffer_bytes: int | None = Field(None, gt=0)
-    """Receiver staging capacity per buffer. None stages a complete update."""
-
-    staging_buffers_count: int = Field(1, ge=1)
-    """Number of receiver buffers. Two overlap the next read with installation."""
-
 
 WeightBroadcastConfig: TypeAlias = Annotated[
     FileSystemWeightBroadcastConfig

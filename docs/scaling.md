@@ -249,6 +249,9 @@ type = "modelexpress"
 host = "mx-server"
 port = 8001
 staging_mode = "COPY_TO_HOST"
+
+[inference.weight_broadcast]
+type = "modelexpress"
 staging_buffer_bytes = 1073741824
 staging_buffers_count = 2
 ```
@@ -261,7 +264,7 @@ broadcast directory; only rendezvous markers use the filesystem, not weights.
 `COPY_TO_HOST` snapshots trainer shards into MX-owned host storage.
 `COPY_TO_DEVICE` uses additional GPU storage. `IN_PLACE` requires unchanged source
 storage and matching transfer dtypes until installation completes. Omitting
-`staging_buffer_bytes` stages a complete receiver update; setting it uses MX's
+`inference.weight_broadcast.staging_buffer_bytes` stages a complete receiver update; setting it uses MX's
 bounded transfer/install through the same `stage_weight()` and `apply_weight()`
 methods. It limits each buffer, and `staging_buffers_count`
 defaults to one. Two buffers overlap the next read with the current install.

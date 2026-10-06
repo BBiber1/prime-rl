@@ -6,6 +6,7 @@ from typing import Annotated, Any, Literal, TypeAlias
 from pydantic import Field, model_validator
 
 from prime_rl.configs.inference import InferenceConfig
+from prime_rl.configs.inference import ModelExpressWeightBroadcastConfig as InferenceModelExpressWeightBroadcastConfig
 from prime_rl.configs.inference import WeightBroadcastConfig as InferenceWeightBroadcastConfig
 from prime_rl.configs.monitors import FileMonitorConfig, PrimeTrainMonitorConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
@@ -455,7 +456,11 @@ class RLConfig(BaseConfig):
         self.trainer.weight_broadcast = self.weight_broadcast.model_copy(update=update)
         self.orchestrator.weight_broadcast = self.weight_broadcast.model_copy(update=update)
         if self.inference is not None:
-            self.inference.weight_broadcast = InferenceWeightBroadcastConfig(type=self.weight_broadcast.type)
+            if self.weight_broadcast.type == "modelexpress":
+                if self.inference.weight_broadcast.type != "modelexpress":
+                    self.inference.weight_broadcast = InferenceModelExpressWeightBroadcastConfig()
+            else:
+                self.inference.weight_broadcast = InferenceWeightBroadcastConfig(type=self.weight_broadcast.type)
         return self
 
     @model_validator(mode="after")

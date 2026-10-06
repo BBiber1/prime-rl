@@ -217,8 +217,18 @@ class VllmConfig(BaseConfig):
 
 
 class WeightBroadcastConfig(BaseConfig):
-    type: Literal["nccl", "filesystem", "nixl", "modelexpress"] = "filesystem"
+    type: Literal["nccl", "filesystem", "nixl"] = "filesystem"
     """Weight broadcast transport."""
+
+
+class ModelExpressWeightBroadcastConfig(BaseConfig):
+    type: Literal["modelexpress"] = "modelexpress"
+
+    staging_buffer_bytes: int | None = Field(None, gt=0)
+    """Receiver staging capacity per buffer. None stages a complete update."""
+
+    staging_buffers_count: int = Field(1, ge=1)
+    """Number of receiver buffers. Two overlap the next read with installation."""
 
 
 class CPUOffloadTier(BaseConfig):
@@ -461,7 +471,9 @@ class InferenceConfig(BaseConfig):
     use_deep_gemm: bool = False
     """Enable vLLM DeepGEMM FP8 kernels ``VLLM_USE_DEEP_GEMM=1``. Only works with block-wise FP8 quantization (e.g. GLM-5-FP8)."""
 
-    weight_broadcast: WeightBroadcastConfig = WeightBroadcastConfig()
+    weight_broadcast: Annotated[
+        WeightBroadcastConfig | ModelExpressWeightBroadcastConfig, Field(discriminator="type")
+    ] = WeightBroadcastConfig()
 
     kv_cache_offload: KVCacheOffloadConfig | None = None
     """KV cache offload for inference workers, as composable CPU/disk tiers. Discriminated on ``type``: ``native`` (vLLM ``OffloadingConnector``/``TieringOffloadingSpec``, self-contained) or ``mooncake`` (per-node Mooncake distributed store). Disaggregated P/D combines the chosen connector with NIXL through ``MultiConnector``."""
@@ -665,5 +677,11 @@ class InferenceConfig(BaseConfig):
         kv_transfer_config = self.build_kv_transfer_config()
         if kv_transfer_config is not None:
             namespace.kv_transfer_config = kv_transfer_config
+
+        if self.weight_broadcast.type == "modelexpress":
+            namespace.additional_config = {
+                **(getattr(namespace, "additional_config", None) or {}),
+                "weight_broadcast": self.weight_broadcast.model_dump(),
+            }
 
         return namespace
