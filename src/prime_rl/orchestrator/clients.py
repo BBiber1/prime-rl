@@ -213,6 +213,8 @@ class AdminPlane:
         on_paused: Callable[[], None] | None = None,
     ) -> None:
         """Install an exact MX version; keep inference paused if installation is uncertain."""
+        from modelexpress import telemetry
+
         async with self._modelexpress_lock:
             if not version_uid:
                 raise ValueError("modelexpress requires version_uid")
@@ -221,9 +223,12 @@ class AdminPlane:
                 on_paused()
 
             async def install(client):
+                carrier = {}
+                telemetry.inject(carrier)
                 response = await client.post(
                     "/update_weights",
-                    json={"version_uid": version_uid},
+                    json={"version_uid": version_uid, "step": step},
+                    headers=carrier,
                     timeout=httpx.Timeout(connect=10.0, read=UPDATE_WEIGHTS_TIMEOUT_S, write=60.0, pool=10.0),
                 )
                 response.raise_for_status()

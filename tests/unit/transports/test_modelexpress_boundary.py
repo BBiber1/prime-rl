@@ -36,7 +36,9 @@ def test_modelexpress_adapter_uses_only_public_clients(relative_path):
         if isinstance(node, ast.ImportFrom):
             module = node.module or ""
             if module.startswith("modelexpress"):
-                assert module == "modelexpress_rl"
+                assert module == "modelexpress_rl" or (
+                    module == "modelexpress" and [name.name for name in node.names] == ["telemetry"]
+                )
                 assert all(not name.name.startswith("_") for name in node.names)
             assert not module.startswith(("grpc", "nixl"))
         if isinstance(node, ast.Import):
@@ -157,3 +159,44 @@ def test_modelexpress_installation_outcome_reaches_non_master_without_shared_sto
     assert calls == ([(0, "release"), (0, "barrier"), (1, "release"), (1, "barrier")] if outcome == "success" else [])
     if errors:
         assert errors[0] == errors[1]
+
+
+def test_modelexpress_worker_preserves_otlp_parent(monkeypatch):
+    import os
+
+    from modelexpress import telemetry
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from prime_rl.inference.vllm.worker.modelexpress import ModelExpressWeightUpdateWorker
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://unused/v1/traces")
+    monkeypatch.setattr(telemetry, "_configured_pid", os.getpid())
+    monkeypatch.setattr(telemetry, "_tracer", provider.get_tracer("worker-test"))
+    cycle = telemetry.RefitCycle({"refit.root": True, "step": 4})
+    carrier = {}
+    cycle.inject(carrier)
+    worker = ModelExpressWeightUpdateWorker()
+    worker._worker_id = "worker-3"
+    worker._rank = 3
+    staged = SimpleNamespace(release=lambda: None)
+    worker._generator = SimpleNamespace(stage_weight=lambda **_kwargs: staged, apply_weight=lambda _handle: None)
+    try:
+        assert worker.update_weights_from_path(version_uid="version-a", trace_context=carrier, step=4) == {
+            "worker_id": "worker-3",
+            "version_uid": "version-a",
+        }
+        cycle.finish()
+        spans = exporter.get_finished_spans()
+        root = next(span for span in spans if span.name == "mx.refit.cycle")
+        refit = next(span for span in spans if span.name == "mx.refit")
+        assert refit.context.trace_id == root.context.trace_id
+        assert refit.parent.span_id == root.context.span_id
+        assert refit.attributes["role"] == "generator" and refit.attributes["rank"] == 3
+        assert refit.attributes["step"] == 4 and refit.attributes["version_uid"] == "version-a"
+    finally:
+        provider.shutdown()

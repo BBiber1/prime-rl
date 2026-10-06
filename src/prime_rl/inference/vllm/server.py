@@ -56,7 +56,13 @@ async def update_weights(request: Request):
     data = await request.json()
     if data.get("version_uid") is not None:
         workers = await engine_client(request).collective_rpc(
-            "update_weights_from_path", args=(data.get("weight_dir"), data["version_uid"])
+            "update_weights_from_path",
+            args=(
+                data.get("weight_dir"),
+                data["version_uid"],
+                {k: request.headers[k] for k in ("traceparent", "tracestate") if k in request.headers},
+                data.get("step", 0),
+            ),
         )
         return {"status": "ok", "workers": workers}
     await engine_client(request).collective_rpc("update_weights_from_path", args=(data.get("weight_dir"),))
