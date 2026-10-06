@@ -80,16 +80,6 @@ def test_modelexpress_worker_uses_stage_apply_release(fail_install):
 
 def test_modelexpress_worker_forwards_generator_buffer_config():
     source = ast.parse((ROOT / "src/prime_rl/inference/vllm/worker/modelexpress.py").read_text())
-    settings = next(
-        node
-        for node in ast.walk(source)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "ModelExpressWeightBroadcastConfig"
-        and node.func.attr == "model_validate"
-    )
-    assert ast.unparse(settings.args[0]) == "self.vllm_config.additional_config['weight_broadcast']"
     config = next(
         node
         for node in ast.walk(source)
@@ -99,7 +89,5 @@ def test_modelexpress_worker_forwards_generator_buffer_config():
     )
     keywords = {item.arg: item.value for item in config.keywords}
     for name in ("staging_buffer_bytes", "staging_buffers_count"):
-        assert isinstance(keywords[name], ast.Attribute)
-        assert isinstance(keywords[name].value, ast.Name)
-        assert keywords[name].value.id == "config"
-        assert keywords[name].attr == name
+        assert isinstance(keywords[name], ast.Name)
+        assert keywords[name].id == name

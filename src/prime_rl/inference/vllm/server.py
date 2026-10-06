@@ -120,8 +120,12 @@ async def init_broadcaster(request: Request):
     inference_world_size = data.get("inference_world_size")
     session_id = data.get("session_id", "default")
     args = (host, port, rank_offset, inference_world_size, timeout, session_id)
+    if "staging_buffer_bytes" in data:
+        args += (data["staging_buffer_bytes"], data["staging_buffers_count"])
     workers = await engine_client(request).collective_rpc("init_broadcaster", args=args)
-    return {"status": "ok", "workers": workers}
+    if "staging_buffer_bytes" in data:
+        return {"status": "ok", "workers": workers}
+    return {"status": "ok"}
 
 
 async def custom_init_app_state(
