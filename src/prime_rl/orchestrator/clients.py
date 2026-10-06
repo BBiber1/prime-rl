@@ -504,9 +504,13 @@ async def _pause_engines(admin_clients: list[AsyncClient], *, step: int) -> None
     """Pause all inference engines, waiting for in-flight requests to drain."""
     logger = get_logger()
     logger.debug(f"Pausing inference engines to update weights to policy v{step}")
-    await asyncio.gather(
-        *[_admin_post(client, "/pause", params={"mode": "keep", "clear_cache": "false"}) for client in admin_clients]
-    )
+    with telemetry.span("mx.refit.pause_engines"):
+        await asyncio.gather(
+            *[
+                _admin_post(client, "/pause", params={"mode": "keep", "clear_cache": "false"})
+                for client in admin_clients
+            ]
+        )
     logger.debug("All inference engines paused")
 
 
@@ -517,7 +521,8 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
     failures is safe; a dropped /resume would leave engines paused indefinitely.
     """
     logger = get_logger()
-    await asyncio.gather(*[_admin_post(client, "/resume") for client in admin_clients])
+    with telemetry.span("mx.refit.resume_engines"):
+        await asyncio.gather(*[_admin_post(client, "/resume") for client in admin_clients])
     logger.debug("All inference engines resumed")
 
 
