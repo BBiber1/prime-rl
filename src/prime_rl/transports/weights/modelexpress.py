@@ -46,6 +46,7 @@ class ModelExpressWeightSender(WeightSender):
 
     def _wait_for_receiver_ready(self, step_dir: Path) -> None:
         telemetry.configure("prime-rl-trainer")
+        carrier = {}
         if telemetry.enabled():
             step = int(step_dir.name.removeprefix("step_"))
             self._cycle = telemetry.RefitCycle({**self._attributes(step), "refit.root": True})
@@ -55,7 +56,18 @@ class ModelExpressWeightSender(WeightSender):
             pending.write_text(json.dumps(carrier))
             pending.replace(step_dir / TRACE_CONTEXT_MARKER)
         try:
-            super()._wait_for_receiver_ready(step_dir)
+            with (
+                telemetry.extracted(carrier),
+                telemetry.span(
+                    "mx.refit.wait_receiver_ready",
+                    {
+                        **self._attributes(int(step_dir.name.removeprefix("step_"))),
+                        "wait.marker": str(step_dir / ".receiver_ready"),
+                        "wait.poll_interval_s": 0.1,
+                    },
+                ),
+            ):
+                super()._wait_for_receiver_ready(step_dir)
         except BaseException as error:
             if self._cycle is not None:
                 self._cycle.finish(error)
@@ -76,7 +88,11 @@ class ModelExpressWeightSender(WeightSender):
 
     def _clean(self, step: int) -> None:
         try:
-            super()._clean(step)
+            carrier = {}
+            if self._cycle is not None:
+                self._cycle.inject(carrier)
+            with telemetry.extracted(carrier), telemetry.span("mx.refit.broadcast_cleanup", self._attributes(step)):
+                super()._clean(step)
         except BaseException as error:
             if self._cycle is not None:
                 self._cycle.finish(error)
@@ -119,12 +135,13 @@ class ModelExpressWeightSender(WeightSender):
     @torch.no_grad()
     def _broadcast(self, model: nn.Module, step: int, step_dir: Path) -> None:
         try:
-            if self._trainer is None:
-                self._initialize(model)
-            assert self._trainer is not None
             carrier_path = step_dir / TRACE_CONTEXT_MARKER
             carrier = json.loads(carrier_path.read_text()) if telemetry.enabled() and carrier_path.exists() else {}
             with telemetry.extracted(carrier):
+                if self._trainer is None:
+                    with telemetry.span("mx.refit.trainer_initialize", self._attributes(step)):
+                        self._initialize(model)
+                assert self._trainer is not None
                 self._publish_and_wait(step, step_dir)
         except BaseException as error:
             if self._cycle is not None:
@@ -145,11 +162,13 @@ class ModelExpressWeightSender(WeightSender):
             )
             offered[0] = version.version_id
             telemetry.inject(offered[1])
-            marker = step_dir / VERSION_MARKER
-            pending = marker.with_suffix(".pending")
-            pending.write_text(version.version_id)
-            pending.replace(marker)
-        dist.broadcast_object_list(offered, src=0)
+            with telemetry.span("mx.refit.version_marker_publish", self._attributes(step, version.version_id)):
+                marker = step_dir / VERSION_MARKER
+                pending = marker.with_suffix(".pending")
+                pending.write_text(version.version_id)
+                pending.replace(marker)
+        with telemetry.span("mx.refit.version_broadcast", self._attributes(step)):
+            dist.broadcast_object_list(offered, src=0)
         version = WeightVersionRef(offered[0])
         with (
             telemetry.extracted(offered[1]),
@@ -168,14 +187,18 @@ class ModelExpressWeightSender(WeightSender):
                 try:
                     installed = step_dir / INSTALLED_MARKER
                     deadline = time.monotonic() + self.timeout
-                    while not installed.exists():
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError(
-                                f"Inference did not install version {version.version_id} within {self.timeout}s"
-                            )
-                        time.sleep(0.1)
-                    if installed.read_text() != version.version_id:
-                        raise RuntimeError("Inference acknowledged a different weight version")
+                    with telemetry.span(
+                        "mx.refit.wait_installed",
+                        {**attributes, "wait.marker": str(installed), "wait.poll_interval_s": 0.1},
+                    ):
+                        while not installed.exists():
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError(
+                                    f"Inference did not install version {version.version_id} within {self.timeout}s"
+                                )
+                            time.sleep(0.1)
+                        if installed.read_text() != version.version_id:
+                            raise RuntimeError("Inference acknowledged a different weight version")
                 except Exception as exc:
                     installation_error[0] = exc
             dist.broadcast_object_list(installation_error, src=0)
@@ -183,7 +206,8 @@ class ModelExpressWeightSender(WeightSender):
                 raise installation_error[0]
             with telemetry.span("mx.refit.release", attributes):
                 self._trainer.release_version(version=version)
-            dist.barrier()
+            with telemetry.span("mx.refit.trainer_barrier", attributes):
+                dist.barrier()
 
 
 class ModelExpressWeightReceiver(WeightReceiver):
@@ -200,9 +224,12 @@ class ModelExpressWeightReceiver(WeightReceiver):
         )
 
     async def receive(self, step: int) -> None:
+        receive_start = time.time_ns()
         self._ack(step)
+        acknowledged = time.time_ns()
         marker = self.step_dir(step) / VERSION_MARKER
         await asyncio.wait_for(wait_for_path(marker, interval=0.01), timeout=self.config.timeout)
+        marker_visible = time.time_ns()
         uid = marker.read_text()
         carrier_path = marker.parent / TRACE_CONTEXT_MARKER
         carrier = json.loads(carrier_path.read_text()) if telemetry.enabled() and carrier_path.exists() else {}
@@ -220,24 +247,38 @@ class ModelExpressWeightReceiver(WeightReceiver):
         with (
             telemetry.extracted(carrier),
             telemetry.refit_attributes(attributes),
-            telemetry.span("mx.refit", attributes),
+            telemetry.span("mx.refit", attributes, start_time=receive_start),
         ):
+            telemetry.completed_span("mx.refit.receiver_ack", receive_start, acknowledged, attributes)
+            telemetry.completed_span(
+                "mx.refit.wait_version_marker",
+                acknowledged,
+                marker_visible,
+                {
+                    **attributes,
+                    "wait.marker": str(marker),
+                    "wait.poll_interval_s": 0.01,
+                },
+            )
             await self._receive_version(step, uid)
 
     async def _receive_version(self, step: int, uid: str) -> None:
         deadline = time.monotonic() + self.config.timeout
-        while True:
-            version = await asyncio.to_thread(self._control.get_weight_version, uid)
-            if version.state is WeightVersionState.READY:
-                break
-            if version.state is WeightVersionState.RELEASING:
-                raise RuntimeError(f"Weight version {uid} was retired before installation")
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"Weight version {uid} was not ready within {self.config.timeout}s")
-            await asyncio.sleep(0.1)
-        await self.admin_plane.update_modelexpress_weights(version_uid=uid, step=step)
+        with telemetry.span("mx.refit.wait_version_ready"):
+            while True:
+                version = await asyncio.to_thread(self._control.get_weight_version, uid)
+                if version.state is WeightVersionState.READY:
+                    break
+                if version.state is WeightVersionState.RELEASING:
+                    raise RuntimeError(f"Weight version {uid} was retired before installation")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Weight version {uid} was not ready within {self.config.timeout}s")
+                await asyncio.sleep(0.1)
+        with telemetry.span("mx.refit.inference_update"):
+            await self.admin_plane.update_modelexpress_weights(version_uid=uid, step=step)
         await asyncio.to_thread(self._control.delete_weight_version, uid)
-        installed = self.step_dir(step) / INSTALLED_MARKER
-        pending = installed.with_suffix(".pending")
-        pending.write_text(uid)
-        pending.replace(installed)
+        with telemetry.span("mx.refit.installed_marker_publish"):
+            installed = self.step_dir(step) / INSTALLED_MARKER
+            pending = installed.with_suffix(".pending")
+            pending.write_text(uid)
+            pending.replace(installed)
