@@ -211,6 +211,7 @@ class AdminPlane:
         version_uid: str,
         step: int = 0,
         on_paused: Callable[[], None] | None = None,
+        trace_context: dict[str, str] | None = None,
     ) -> None:
         """Install an exact MX version; keep inference paused if installation is uncertain."""
         from modelexpress import telemetry
@@ -225,7 +226,7 @@ class AdminPlane:
 
             async def install(client):
                 carrier = {}
-                telemetry.inject(carrier)
+                generators.inject(carrier)
                 response = await client.post(
                     "/update_weights",
                     json={"version_uid": version_uid, "step": step},
@@ -234,13 +235,22 @@ class AdminPlane:
                 )
                 response.raise_for_status()
 
-            with telemetry.span("mx.refit.update_weights_rpc"):
-                results = await asyncio.gather(*(install(client) for client in self.clients), return_exceptions=True)
-            for result in results:
-                if isinstance(result, BaseException):
-                    raise result
-            with telemetry.span("mx.refit.resume_engines"):
-                await _resume_engines(self.clients)
+            generators = telemetry.RefitCycle({"role": "generator"}, name="mx.refit.generators", parent=trace_context)
+            error = None
+            try:
+                with telemetry.span("mx.refit.update_weights_rpc"):
+                    results = await asyncio.gather(*(install(client) for client in self.clients), return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                with telemetry.span("mx.refit.resume_engines"):
+                    await _resume_engines(self.clients)
+            except BaseException as failure:
+                error = failure
+                raise
+            finally:
+                generators.finish(error)
+
 
     async def initialize_modelexpress(
         self,

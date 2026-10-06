@@ -60,7 +60,7 @@ async def update_weights(request: Request):
             args=(
                 data.get("weight_dir"),
                 data["version_uid"],
-                {k: request.headers[k] for k in ("traceparent", "tracestate") if k in request.headers},
+                {k: request.headers[k] for k in ("traceparent", "tracestate", "baggage") if k in request.headers},
                 data.get("step", 0),
             ),
         )
