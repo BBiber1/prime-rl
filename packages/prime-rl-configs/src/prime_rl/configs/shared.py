@@ -84,9 +84,6 @@ class ModelExpressWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     port: int = 8001
     """ModelExpress gRPC port."""
 
-    coordination_port: int = Field(8002, ge=1, le=65535)
-    """Orchestrator request/reply port for weight offers and installation acknowledgments."""
-
     staging_mode: Literal["COPY_TO_HOST", "COPY_TO_DEVICE", "IN_PLACE"] = "COPY_TO_HOST"
     """Trainer storage policy passed to ModelExpress."""
 
