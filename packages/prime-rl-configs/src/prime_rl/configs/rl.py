@@ -436,7 +436,7 @@ class RLConfig(BaseConfig):
         if "inference_world_size" in self.weight_broadcast.model_fields_set:
             raise ValueError("weight_broadcast.inference_world_size is set automatically by rl; remove it.")
         if self.weight_broadcast.type == "modelexpress":
-            dynamo = self.orchestrator.client.dynamo
+            dynamo = self.orchestrator.model.client.dynamo
             if dynamo is not None and dynamo.enabled:
                 raise ValueError(
                     "modelexpress requires static inference admin endpoints; Dynamo discovery is not supported."
