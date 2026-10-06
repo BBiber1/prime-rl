@@ -234,7 +234,8 @@ class AdminPlane:
                 )
                 response.raise_for_status()
 
-            results = await asyncio.gather(*(install(client) for client in self.clients), return_exceptions=True)
+            with telemetry.span("mx.refit.update_weights_rpc"):
+                results = await asyncio.gather(*(install(client) for client in self.clients), return_exceptions=True)
             for result in results:
                 if isinstance(result, BaseException):
                     raise result
