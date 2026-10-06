@@ -214,13 +214,14 @@ class AdminPlane:
         step: int = 0,
         on_paused: Callable[[], None] | None = None,
         version_uid: str | None = None,
+        trace_context: dict[str, str] | None = None,
     ) -> None:
         """Update every inference engine through its configured weight transport."""
         weight_dir_posix = weight_dir.as_posix() if weight_dir is not None else None
 
         if transport == "modelexpress":
             async with self._modelexpress_lock:
-                await self._update_modelexpress_weights(version_uid, step, on_paused)
+                await self._update_modelexpress_weights(version_uid, step, on_paused, trace_context)
             return
 
         await _pause_engines(self.clients, step=step)
@@ -242,7 +243,11 @@ class AdminPlane:
             await _resume_engines(self.clients)
 
     async def _update_modelexpress_weights(
-        self, version_uid: str | None, step: int, on_paused: Callable[[], None] | None
+        self,
+        version_uid: str | None,
+        step: int,
+        on_paused: Callable[[], None] | None,
+        trace_context: dict[str, str] | None = None,
     ) -> None:
         from modelexpress import telemetry
 
@@ -258,7 +263,7 @@ class AdminPlane:
 
         async def install(client):
             carrier = {}
-            telemetry.inject(carrier)
+            generators.inject(carrier)
             response = await client.post(
                 "/update_weights",
                 json={"version_uid": version_uid, "step": step},
@@ -268,21 +273,29 @@ class AdminPlane:
             response.raise_for_status()
             return response.json()["workers"]
 
-        with telemetry.span("mx.refit.update_weights_rpc"):
-            results = await asyncio.gather(*(install(client) for client in self.clients), return_exceptions=True)
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
-        acknowledgments = [worker for workers in results for worker in workers]
-        if (
-            len(acknowledgments) != len(self._modelexpress_workers)
-            or {worker["worker_id"] for worker in acknowledgments} != self._modelexpress_workers
-            or any(worker["version_uid"] != version_uid for worker in acknowledgments)
-        ):
-            raise RuntimeError("Not every inference worker acknowledged the requested weight version")
-        with telemetry.span("mx.refit.resume_engines"):
-            await _resume_engines(self.clients)
-        self._modelexpress_failed = False
+        generators = telemetry.RefitCycle({"role": "generator"}, name="mx.refit.generators", parent=trace_context)
+        error = None
+        try:
+            with telemetry.span("mx.refit.update_weights_rpc"):
+                results = await asyncio.gather(*(install(client) for client in self.clients), return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            acknowledgments = [worker for workers in results for worker in workers]
+            if (
+                len(acknowledgments) != len(self._modelexpress_workers)
+                or {worker["worker_id"] for worker in acknowledgments} != self._modelexpress_workers
+                or any(worker["version_uid"] != version_uid for worker in acknowledgments)
+            ):
+                raise RuntimeError("Not every inference worker acknowledged the requested weight version")
+            with telemetry.span("mx.refit.resume_engines"):
+                await _resume_engines(self.clients)
+            self._modelexpress_failed = False
+        except BaseException as failure:
+            error = failure
+            raise
+        finally:
+            generators.finish(error)
 
     async def initialize_modelexpress(
         self,

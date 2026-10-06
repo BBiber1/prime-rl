@@ -107,7 +107,7 @@ def test_modelexpress_worker_preserves_otlp_parent(monkeypatch):
 
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    provider.add_span_processor(telemetry.RefitSpanProcessor(SimpleSpanProcessor(exporter)))
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://unused/v1/traces")
     monkeypatch.setattr(telemetry, "_configured_pid", os.getpid())
     monkeypatch.setattr(telemetry, "_tracer", provider.get_tracer("worker-test"))
@@ -127,7 +127,7 @@ def test_modelexpress_worker_preserves_otlp_parent(monkeypatch):
         cycle.finish()
         spans = exporter.get_finished_spans()
         root = next(span for span in spans if span.name == "mx.refit.cycle")
-        refit = next(span for span in spans if span.name == "mx.refit")
+        refit = next(span for span in spans if span.name == "mx.refit.generator")
         assert refit.context.trace_id == root.context.trace_id
         assert refit.parent.span_id == root.context.span_id
         assert refit.attributes["role"] == "generator" and refit.attributes["rank"] == 3

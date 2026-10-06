@@ -1,7 +1,6 @@
 """vLLM extension using the public ModelExpress generator client."""
 
 import atexit
-import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -72,21 +71,14 @@ class ModelExpressWeightUpdateWorker(Worker):
         if version_uid is None:
             raise ValueError("modelexpress requires version_uid")
         telemetry.configure("prime-rl-inference")
-        attributes = {
-            "role": "generator",
-            "rank": getattr(self, "_rank", 0),
-            "step": step,
-            "version_uid": version_uid,
-            "refit.id": version_uid,
-            "refit.step": step,
-            "refit.phase": "cold" if step == 0 else "warm",
-            "experiment": os.environ.get("MX_REFIT_EXPERIMENT", ""),
-            "staging_mode": os.environ.get("MX_REFIT_STAGING_MODE", ""),
-        }
         with (
             telemetry.extracted(trace_context or {}),
-            telemetry.refit_attributes(attributes),
-            telemetry.span("mx.refit", attributes),
+            telemetry.refit_attributes(
+                {"step": step, "refit.step": step, "version_uid": version_uid, "refit.id": version_uid},
+                role="generator",
+                rank=getattr(self, "_rank", 0),
+            ),
+            telemetry.refit_span("mx.refit.generator"),
         ):
             version = WeightVersionRef(version_uid)
             staged = self._generator.stage_weight(version=version)
@@ -94,4 +86,4 @@ class ModelExpressWeightUpdateWorker(Worker):
                 self._generator.apply_weight(staged)
             finally:
                 staged.release()
-            return {"worker_id": self._worker_id, "version_uid": version_uid}
+        return {"worker_id": self._worker_id, "version_uid": version_uid}
