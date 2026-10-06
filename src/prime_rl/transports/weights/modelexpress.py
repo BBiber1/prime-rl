@@ -174,15 +174,17 @@ class ModelExpressWeightSender(WeightSender):
                 pending = marker.with_suffix(".pending")
                 pending.write_text(json.dumps({"version_uid": version.version_id, "trace_context": offered[1]}))
                 pending.replace(marker)
-        with telemetry.span("mx.refit.version_broadcast", self._attributes(step)):
-            dist.broadcast_object_list(offered, src=0)
+        broadcast_start = time.time_ns()
+        dist.broadcast_object_list(offered, src=0)
+        broadcast_end = time.time_ns()
         version = WeightVersionRef(offered[0])
         with (
             telemetry.extracted(offered[1]),
             telemetry.refit_attributes(self._attributes(step, version.version_id)),
-            telemetry.span("mx.refit", self._attributes(step, version.version_id)),
+            telemetry.span("mx.refit", self._attributes(step, version.version_id), start_time=broadcast_start),
         ):
             attributes = self._attributes(step, version.version_id)
+            telemetry.completed_span("mx.refit.version_broadcast", broadcast_start, broadcast_end, attributes)
             if self._cycle is not None:
                 self._cycle.set_attributes(attributes)
             with telemetry.span("mx.refit.publish", attributes):
