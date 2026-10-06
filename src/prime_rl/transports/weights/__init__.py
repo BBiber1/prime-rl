@@ -1,4 +1,3 @@
-from importlib.util import find_spec
 from pathlib import Path
 
 import torch
@@ -20,16 +19,6 @@ __all__ = [
 ]
 
 
-def _check_modelexpress_installation(transport: str) -> None:
-    module = {"nixl": "modelexpress", "modelexpress": "modelexpress_rl"}.get(transport)
-    if module is not None and find_spec(module) is None:
-        raise ImportError(
-            f"The {transport} transport requires a separately installed compatible ModelExpress client. "
-            "See the ModelExpress weight broadcast installation instructions in docs/scaling.md. "
-            "The new modelexpress transport cannot use the published 0.7.0 package."
-        )
-
-
 def setup_weight_sender(
     output_dir: Path,
     config: WeightBroadcastConfig,
@@ -37,7 +26,6 @@ def setup_weight_sender(
     lora_config: LoRAConfig | None = None,
     model_name: str | None = None,
 ) -> WeightSender:
-    _check_modelexpress_installation(config.type)
     if config.type == "nccl":
         return NCCLWeightSender(output_dir, config, torch.cuda.current_device())
     elif config.type == "filesystem":
@@ -62,7 +50,6 @@ def setup_weight_receiver(
     admin_plane: AdminPlane,
     model_name: str,
 ) -> WeightReceiver:
-    _check_modelexpress_installation(config.type)
     if config.type == "nccl":
         return NCCLWeightReceiver(broadcast_dir, config, admin_plane, model_name)
     elif config.type == "filesystem":

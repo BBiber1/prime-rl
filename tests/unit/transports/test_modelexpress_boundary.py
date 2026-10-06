@@ -9,31 +9,6 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 
 
-@pytest.mark.parametrize("transport", ["filesystem", "nccl", "nixl", "modelexpress"])
-@pytest.mark.parametrize("installed", [False, True])
-def test_optional_modelexpress_installation(transport, installed):
-    source = ast.parse((ROOT / "src/prime_rl/transports/weights/__init__.py").read_text())
-    check = next(
-        node
-        for node in source.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_check_modelexpress_installation"
-    )
-    modules = []
-
-    def find_spec(name):
-        modules.append(name)
-        return object() if installed else None
-
-    namespace = {"find_spec": find_spec}
-    exec(compile(ast.Module(body=[check], type_ignores=[]), "<installation-check>", "exec"), namespace)
-    if transport in ("nixl", "modelexpress") and not installed:
-        with pytest.raises(ImportError, match="separately installed compatible ModelExpress"):
-            namespace[check.name](transport)
-    else:
-        namespace[check.name](transport)
-    assert modules == ({"nixl": ["modelexpress"], "modelexpress": ["modelexpress_rl"]}.get(transport, []))
-
-
 @pytest.mark.parametrize(
     "relative_path",
     [
