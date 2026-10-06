@@ -38,11 +38,14 @@ def prune_broadcasts_beyond(output_dir: Path, step: int) -> None:
 
 class WeightSender(ABC):
     """Trainer-side weight publisher. ``broadcast`` wraps the transport's
-    ``_broadcast`` with the shared sentinel handshake: every version is
+    ``_broadcast`` with the transport handshake. Filesystem-based transports use
+    the shared sentinel handshake: every version is
     offered (``.sender_ready``), acknowledged by the consumer
     (``.receiver_ready``), transferred (``.started``), and committed
     (``.finished``). The trainer therefore runs in lockstep with its consumer
     on every transport — a broadcast nobody receives blocks and then fails."""
+
+    filesystem_handshake = True
 
     def __init__(self, output_dir: Path, timeout: int):
         self.logger = get_logger()
@@ -55,6 +58,10 @@ class WeightSender(ABC):
         """Broadcast policy v{step} to the inference pool."""
         start_time = time.perf_counter()
         step_dir = self.step_dir(step)
+        if not self.filesystem_handshake:
+            self._broadcast(model, step, step_dir)
+            self.logger.debug(f"Broadcasted weights for step {step} in {time.perf_counter() - start_time:.2f}s")
+            return
         if self.world.is_master:
             # Reset per attempt so a re-broadcast (e.g. on resume) never trips
             # the consumer or the trainer on stale markers of a previous run.
@@ -136,13 +143,17 @@ class WeightReceiver(ABC):
     def step_dir(self, step: int) -> Path:
         return get_step_path(self.broadcast_dir, step)
 
+    def available_versions(self) -> list[int]:
+        """Versions currently offered by this transport."""
+        return get_all_ckpt_steps(self.broadcast_dir)
+
     def is_published(self, step: int) -> bool:
         """Whether the trainer has offered v{step}."""
         return (self.step_dir(step) / SENDER_READY_MARKER).exists()
 
     def next_version(self, current: int) -> int:
         """Newest version offered beyond ``current``; ``current`` if none."""
-        published = [step for step in get_all_ckpt_steps(self.broadcast_dir) if self.is_published(step)]
+        published = [step for step in self.available_versions() if self.is_published(step)]
         return max(published, default=current)
 
     async def wait_published(self, step: int, cancelled: Callable[[], bool] | None = None) -> None:

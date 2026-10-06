@@ -23,7 +23,7 @@ from prime_rl.eval.runner import POLL_INTERVAL_S, EvalRunner
 from prime_rl.transports.weights import WeightReceiver, setup_weight_receiver
 from prime_rl.utils.config import cli, dump_resolved_config
 from prime_rl.utils.logger import get_logger, setup_logger
-from prime_rl.utils.pathing import get_all_ckpt_steps, prepare_attempt_dirs
+from prime_rl.utils.pathing import prepare_attempt_dirs
 from prime_rl.utils.process import set_proc_title
 from prime_rl.utils.utils import clean_exit
 
@@ -100,7 +100,7 @@ class OnlineEval:
 
         get_logger().info(f"Watching {config.broadcasts_dir} for new weight broadcasts (max_steps={config.max_steps})")
         while True:
-            steps = get_all_ckpt_steps(config.broadcasts_dir)
+            steps = self.receiver.available_versions()
             published = {step: self.receiver.is_published(step) for step in steps}
             newest_published = max((step for step in steps if published[step]), default=None)
             # Also walk eval-due steps that are no longer on disk: broadcast cleaning
@@ -142,7 +142,7 @@ class OnlineEval:
         return next(
             (
                 candidate
-                for candidate in get_all_ckpt_steps(self.config.broadcasts_dir)
+                for candidate in self.receiver.available_versions()
                 if candidate > step and self.receiver.is_published(candidate)
             ),
             None,
