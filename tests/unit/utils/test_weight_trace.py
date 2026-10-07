@@ -101,9 +101,10 @@ def test_phase_buffers_are_bounded_and_disabled_is_inert():
         recorder.bind(phases.append)
     assert phases[0].attributes["trace.dropped_phases"] == 18
     for _ in range(50):
-        with recorder.phase("receiver_scan"):
-            pass
-    assert len(recorder.poll) == 1
+        for name in ("receiver_scan", "confirm_offer"):
+            with recorder.phase(name):
+                pass
+    assert len(recorder.poll) == 2
     disabled = PhaseRecorder(lambda: False)
     with disabled.session() as session, disabled.phase("prepare"):
         pass

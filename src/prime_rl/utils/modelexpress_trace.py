@@ -18,6 +18,7 @@ class ReceiverTrace:
     uid: str = ""
     accepted: bool = False
     role: telemetry.RefitCycle | None = None
+    metadata_read: bool = False
 
 
 class ReceiverTracing:
@@ -32,18 +33,23 @@ class ReceiverTracing:
         return self._phases.phase(name, attributes)
 
     def _read_offer(self, state: ReceiverTrace) -> None:
-        if state.carrier or not telemetry.enabled():
+        if state.metadata_read or not telemetry.enabled():
             return
+        state.metadata_read = True
         try:
             offer = read_offer(self.step_dir(state.step) / ".sender_ready", state.step)
             if offer is not None:
+                if state.carrier and offer["trace_context"].get("traceparent") != state.carrier.get("traceparent"):
+                    raise ValueError("sender offer/version trace mismatch")
                 with telemetry.extracted(offer["trace_context"]):
                     pass
-        except (ValueError, OSError) as error:
+        except Exception as error:
             self.logger.warning(f"Ignoring sender trace metadata for step {state.step}: {error}")
             return
         if offer is not None:
-            state.offer, state.carrier = offer, offer["trace_context"]
+            state.offer = offer
+            if not state.carrier:
+                state.carrier = offer["trace_context"]
 
     def attributes(self, state: ReceiverTrace) -> dict:
         return {
@@ -60,38 +66,42 @@ class ReceiverTracing:
         }
 
     def _emit_phase(self, state: ReceiverTrace, phase: Phase) -> None:
-        parent = state.role.active() if state.role is not None else telemetry.extracted(state.carrier)
-        with parent, telemetry.refit_attributes(self.attributes(state)):
-            telemetry.completed_span(
-                f"mx.refit.{phase.name}", phase.start, phase.end, phase.attributes, error=phase.error
-            )
+        try:
+            parent = state.role.active() if state.role is not None else telemetry.extracted(state.carrier)
+            with parent, telemetry.refit_attributes(self.attributes(state)):
+                telemetry.completed_span(
+                    f"mx.refit.{phase.name}", phase.start, phase.end, phase.attributes, error=phase.error
+                )
+        except Exception as error:
+            self.logger.warning(f"Cannot record receiver phase {phase.name}: {error}")
 
     def trace_accept(self) -> None:
         state = self._trace.get()
         assert state is not None
         state.accepted = True
-        self._read_offer(state)
-        if not telemetry.enabled() or not state.carrier or state.role is not None:
-            return
-        state.role = telemetry.RefitCycle(self.attributes(state), name="mx.refit.orchestrator", parent=state.carrier)
-        for phase in discovery_phases(state.offer, self._phases.poll, clock_identity()):
-            self._emit_phase(state, phase)
-        self._phases.bind(lambda phase: self._emit_phase(state, phase))
+        try:
+            telemetry.configure("prime-rl-orchestrator")
+            self._read_offer(state)
+            if not telemetry.enabled() or not state.carrier or state.role is not None:
+                return
+            state.role = telemetry.RefitCycle(
+                self.attributes(state), name="mx.refit.orchestrator", parent=state.carrier
+            )
+            for phase in discovery_phases({"step": state.step, **state.offer}, self._phases.poll, clock_identity()):
+                self._emit_phase(state, phase)
+            self._phases.bind(lambda phase: self._emit_phase(state, phase))
+        except Exception as error:
+            self.logger.warning(f"Cannot start receiver telemetry for step {state.step}: {error}")
 
     @contextmanager
     def trace_update(self, step: int):
-        telemetry.configure("prime-rl-orchestrator")
         state = ReceiverTrace(step)
         token = self._trace.set(state)
         error = None
         try:
             with self._phases.session():
-                self._read_offer(state)
                 try:
                     yield
-                    self._read_offer(state)
-                    if state.carrier and state.role is None:
-                        self._phases.bind(lambda phase: self._emit_phase(state, phase))
                 except BaseException as failure:
                     error = failure
                     self._read_offer(state)
@@ -105,7 +115,10 @@ class ReceiverTracing:
                     raise
         finally:
             if state.role is not None:
-                state.role.finish(error)
+                try:
+                    state.role.finish(error)
+                except Exception as failure:
+                    self.logger.warning(f"Cannot finish receiver telemetry for step {state.step}: {failure}")
             if state.accepted:
                 self._phases.poll.clear()
             self._trace.reset(token)
