@@ -55,25 +55,22 @@ def test_invalid_offer_is_rejected(tmp_path, mutation):
         read_offer(marker, 3)
 
 
-def test_discovery_clips_idle_sleep_only_for_shared_clock():
-    poll = {
-        "watcher_poll_sleep": Phase("watcher_poll_sleep", 100, 200, 10, 110, {}),
-        "watcher_scan": Phase("watcher_scan", 200, 220, 110, 130, {}),
-    }
-    offer = {"sender_host": "host", "clock_id": "boot/ns", "offered_at_monotonic_ns": 60}
-    phases = discovery_phases(offer, poll, ("host", "boot/ns"))
-    sleep, scan, elapsed = phases
-    assert (sleep.start, sleep.end) == (150, 200)
+def test_discovery_latency_requires_shared_clock_and_matching_step():
+    poll = {"receiver_scan": Phase("receiver_scan", 200, 220, 110, 130, {"step": 3})}
+    offer = {"step": 3, "sender_host": "host", "clock_id": "boot/ns", "offered_at_monotonic_ns": 60}
+    scan, elapsed = discovery_phases(offer, poll, ("host", "boot/ns"))
     assert (scan.start, scan.end) == (200, 220)
     assert (elapsed.start, elapsed.end) == (150, 220)
+    scan, elapsed = discovery_phases({**offer, "offered_at_monotonic_ns": 120}, poll, ("host", "boot/ns"))
+    assert (scan.start, scan.end) == (210, 220)
     for identity in (("other-host", "boot/ns"), ("host", "other-ns"), ("host", "")):
         phases = discovery_phases(offer, poll, identity)
-        assert [p.name for p in phases] == ["watcher_scan"]
+        assert [p.name for p in phases] == ["receiver_scan"]
         assert phases[0].attributes["offer.clock_shared"] is False
-        assert phases[0].attributes["watcher.previous_sleep_s"] == 100 / 1e9
     assert [p.name for p in discovery_phases({**offer, "offered_at_monotonic_ns": 140}, poll, ("host", "boot/ns"))] == [
-        "watcher_scan"
+        "receiver_scan"
     ]
+    assert discovery_phases({**offer, "step": 4}, poll, ("host", "boot/ns")) == []
     assert discovery_phases(offer, {}, clock_identity()) == []
 
 
@@ -104,10 +101,9 @@ def test_phase_buffers_are_bounded_and_disabled_is_inert():
         recorder.bind(phases.append)
     assert phases[0].attributes["trace.dropped_phases"] == 18
     for _ in range(50):
-        for name in ("watcher_scan", "watcher_poll_sleep"):
-            with recorder.phase(name):
-                pass
-    assert len(recorder.poll) == 2
+        with recorder.phase("receiver_scan"):
+            pass
+    assert len(recorder.poll) == 1
     disabled = PhaseRecorder(lambda: False)
     with disabled.session() as session, disabled.phase("prepare"):
         pass

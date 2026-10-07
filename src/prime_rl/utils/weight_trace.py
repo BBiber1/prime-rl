@@ -1,6 +1,5 @@
 """Bounded phase timing without installing a tracing context on application tasks."""
 
-import asyncio
 import json
 import os
 import re
@@ -99,7 +98,6 @@ class PhaseSession:
     pending: deque[Phase] = field(default_factory=lambda: deque(maxlen=32))
     emit: Callable[[Phase], None] | None = None
     dropped: int = 0
-    task: asyncio.Task | None = None
     active: bool = True
 
 
@@ -112,10 +110,6 @@ class PhaseRecorder:
     @contextmanager
     def session(self) -> Iterator[PhaseSession]:
         session = PhaseSession()
-        try:
-            session.task = asyncio.current_task()
-        except RuntimeError:
-            pass
         token = self.current.set(session)
         try:
             yield session
@@ -140,7 +134,7 @@ class PhaseRecorder:
         session = self.current.get()
         if session is not None and not session.active:
             session = None
-        if not self.enabled() or (session is None and name not in {"watcher_scan", "watcher_poll_sleep"}):
+        if not self.enabled() or (session is None and name != "receiver_scan"):
             yield attrs
             return
         start, mono_start = time_ns(), monotonic_ns()
@@ -159,14 +153,14 @@ class PhaseRecorder:
                     if len(session.pending) == session.pending.maxlen:
                         session.dropped += 1
                     session.pending.append(phase)
-            elif name in {"watcher_scan", "watcher_poll_sleep"}:
+            elif name == "receiver_scan":
                 self.poll[name] = phase
 
 
 def discovery_phases(offer: dict, poll: dict[str, Phase], local_identity: tuple[str, str]) -> list[Phase]:
-    """Clip idle samples only when sender and receiver share a monotonic clock."""
-    scan = poll.get("watcher_scan")
-    if scan is None:
+    """Derive offer latency only when sender and receiver share a monotonic clock."""
+    scan = poll.get("receiver_scan")
+    if scan is None or scan.attributes.get("step") != offer.get("step"):
         return []
     host, clock = local_identity
     shared = bool(clock) and offer.get("sender_host") == host and offer.get("clock_id") == clock
@@ -181,25 +175,20 @@ def discovery_phases(offer: dict, poll: dict[str, Phase], local_identity: tuple[
         },
     }
     if not shared or not isinstance(offered, int) or offered > scan.monotonic_end:
-        sleep = poll.get("watcher_poll_sleep")
-        if sleep is not None:
-            attrs["watcher.previous_sleep_s"] = (sleep.monotonic_end - sleep.monotonic_start) / 1e9
         return [Phase(scan.name, scan.start, scan.end, scan.monotonic_start, scan.monotonic_end, attrs, scan.error)]
     phases = []
-    for sample in poll.values():
-        begin, end = max(offered, sample.monotonic_start), sample.monotonic_end
-        if end >= begin:
-            phases.append(
-                Phase(
-                    sample.name,
-                    sample.end - (end - begin),
-                    sample.end,
-                    begin,
-                    end,
-                    {**sample.attributes, "offer.clock_shared": True},
-                    sample.error,
-                )
-            )
+    begin, end = max(offered, scan.monotonic_start), scan.monotonic_end
+    phases.append(
+        Phase(
+            scan.name,
+            scan.end - (end - begin),
+            scan.end,
+            begin,
+            end,
+            {**scan.attributes, "offer.clock_shared": True},
+            scan.error,
+        )
+    )
     phases.append(
         Phase(
             "offer_to_discovery",

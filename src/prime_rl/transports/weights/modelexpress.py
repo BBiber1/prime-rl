@@ -25,7 +25,7 @@ from torch import nn
 
 from prime_rl.configs.shared import ModelExpressWeightBroadcastConfig
 from prime_rl.transports.weights.base import SENDER_READY_MARKER, WeightReceiver, WeightSender
-from prime_rl.utils.modelexpress_trace import ReceiverTracing, RefitLock
+from prime_rl.utils.modelexpress_trace import ReceiverTracing
 from prime_rl.utils.pathing import wait_for_path
 from prime_rl.utils.weight_trace import publish_offer
 
@@ -257,30 +257,15 @@ class ModelExpressWeightReceiver(WeightReceiver):
         super().__init__(*args, **kwargs)
         self._updates = ReceiverTracing(self.step_dir, self.config.staging_mode, self.logger)
 
-    def trace_phase(self, name: str, attributes: dict | None = None):
-        return self._updates.trace_phase(name, attributes)
-
-    def trace_accept(self) -> None:
-        self._updates.trace_accept()
-
-    def trace_update(self, step: int):
-        return self._updates.trace_update(step)
-
-    def trace_lock(self, phase: str):
-        return RefitLock(self._updates, phase)
+    def next_version(self, current: int) -> int:
+        with self._updates.trace_phase("receiver_scan") as attributes:
+            next_step = super().next_version(current)
+            attributes["step"] = next_step
+        return next_step
 
     async def wait_published(self, step: int, cancelled=None) -> None:
-        if self._updates.current is not None:
-            self.trace_accept()
-        with self.trace_phase("confirm_offer"):
+        with self._updates.trace_update(step), self._updates.trace_phase("confirm_offer"):
             await super().wait_published(step, cancelled=cancelled)
-
-    async def sync_startup(self, step: int, timeout: float) -> None:
-        if self._updates.current is None:
-            with self.trace_update(step):
-                await self.sync_startup(step, timeout)
-            return
-        await super().sync_startup(step, timeout)
 
     async def initialize(self) -> None:
         self._control = ModelExpressControlClient.connect(server_url=f"{self.config.host}:{self.config.port}")
@@ -295,32 +280,29 @@ class ModelExpressWeightReceiver(WeightReceiver):
         )
 
     async def receive(self, step: int) -> None:
-        state = self._updates.current
-        if state is None:
-            with self.trace_update(step):
-                await self.receive(step)
-            return
-        self.trace_accept()
-        with self.trace_phase("receiver_ack"):
-            self._ack(step)
-        marker = self.step_dir(step) / VERSION_MARKER
-        with self.trace_phase("wait_version_marker", {"wait.marker": str(marker)}):
-            await asyncio.wait_for(wait_for_path(marker, interval=0.01), timeout=self.config.timeout)
-            uid = marker.read_text()
-        with self.trace_phase("version_context_lookup"), telemetry.untraced():
-            version = await asyncio.to_thread(self._control.get_weight_version, uid)
-        carrier = version.trace_context
-        state.uid = uid
-        if not state.carrier:
-            state.carrier = carrier
-            self.trace_accept()
-        if state.role is not None:
-            state.role.set_attributes({"version_uid": uid, "refit.id": uid})
-        with (
-            state.role.active() if state.role is not None else nullcontext(),
-            telemetry.refit_attributes(self._updates.attributes(state)),
-        ):
-            await self._receive_version(step, uid, carrier, version)
+        with self._updates.trace_update(step):
+            state = self._updates.current
+            self._updates.trace_accept()
+            with self._updates.trace_phase("receiver_ack"):
+                self._ack(step)
+            marker = self.step_dir(step) / VERSION_MARKER
+            with self._updates.trace_phase("wait_version_marker", {"wait.marker": str(marker)}):
+                await asyncio.wait_for(wait_for_path(marker, interval=0.01), timeout=self.config.timeout)
+                uid = marker.read_text()
+            with self._updates.trace_phase("version_context_lookup"), telemetry.untraced():
+                version = await asyncio.to_thread(self._control.get_weight_version, uid)
+            carrier = version.trace_context
+            state.uid = uid
+            if not state.carrier:
+                state.carrier = carrier
+                self._updates.trace_accept()
+            if state.role is not None:
+                state.role.set_attributes({"version_uid": uid, "refit.id": uid})
+            with (
+                state.role.active() if state.role is not None else nullcontext(),
+                telemetry.refit_attributes(self._updates.attributes(state)),
+            ):
+                await self._receive_version(step, uid, carrier, version)
 
     async def _receive_version(self, step: int, uid: str, carrier: dict, version) -> None:
         deadline = time.monotonic() + self.config.timeout
