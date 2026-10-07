@@ -307,52 +307,13 @@ W3C context. Resource attributes identify the experiment and run. Exporters are
 initialized in each worker process and flushed on shutdown. Without an OTLP
 endpoint, the additional instrumentation is inert.
 
-The MX client must support `telemetry.completed_span(..., error=...)` for receiver
-phase failures and cancellation. With tracing enabled, the sender atomically
-publishes the early cycle carrier in the existing `.sender_ready` marker, together
-with schema, step/run identity, host/clock identity and offer timestamps. The
-receiver validates that metadata and falls back to MX version metadata when the
-early carrier is unavailable or invalid. Handshake decisions still use marker
-existence, and other transports retain empty sender markers. The base sender adds
-only a publication hook; receiver tracing stays in the MX implementation.
-
-The MX receiver overrides `next_version` and `wait_published` to record
-`receiver_scan` and `confirm_offer` without changing discovery or handshake
-decisions. The generic watcher, dispatcher and orchestrator have no tracing
-changes or transport-specific subclasses. The default polling intervals remain
-unchanged. Scan and confirmation store their latest timings by phase name;
-one MX-specific helper holds the marker metadata and a per-reception trace
-object. There is no generic recorder or context-local session. These timings
-are exported after the version-context lookup. `mx.refit.orchestrator` starts
-at the recorded entry to `wait_published` (`confirm_offer`) and covers reception
-through the installation marker, including ACK, version-marker wait and context
-lookup. Discovery spans (`receiver_scan` and `offer_to_discovery`) attach directly
-to the cycle root, so they do not extend the orchestrator start earlier.
-The span object is created after lookup returns its carrier; MX sets its exported
-bounds from the recorded child spans. Direct reception without `wait_published`
-starts at the first recorded reception phase. A failure before lookup can instead
-create the span while unwinding, using the early sender carrier.
-
-Offer-to-discovery elapsed time requires matching host and monotonic clock
-identities and a scan for the same step. Other placements retain raw sender
-timestamps and scan diagnostics. Watcher sleep, update-lock acquisition,
-dispatcher scheduling/cancellation, policy advancement and post-update
-notifications are not separately instrumented. In particular, an interval
-between confirmation and receiver entry cannot establish which observer or
-scheduling activity caused the delay. The receiver closes its trace context
-before the watcher resumes and schedules new rollouts.
-
-The receiver publishes its ACK, waits for the version marker and looks up the
-version before reading sender trace metadata or exporting additional phases.
-Metadata is read at most once per reception. Disabled scan/confirmation paths
-delegate directly to the base receiver. Sender metadata publication failure
-falls back to the empty marker; optional receiver phase/envelope failures are
-logged without replacing operation errors. Sender-offer timing is exported
-after the readiness wait. The changes add no polling, locks, collectives, RPCs,
-exporter flushes or transfer-completion barriers. The MX facade uses its existing
-batch exporter. Enabled tracing still costs timestamp capture, JSON marker I/O
-and span bookkeeping; unchanged end-to-end performance requires an enabled vs
-disabled comparison with the same workload and placement.
+The MX receiver records entry and exit timestamps for `wait_published`, then
+exports `mx.refit.wait_published` inside `mx.refit.orchestrator` after the existing
+version lookup provides its trace carrier. The orchestrator envelope starts at
+that recorded wait entry and ends after `.installed`. Direct reception without
+the wait retains its existing start. Handshake markers, polling and sender code
+are unchanged. MX revisions containing the root-service change export
+`mx.refit.cycle` under service `root`; role services keep their configured names.
 
 ### NIXL weight broadcast
 
