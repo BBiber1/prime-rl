@@ -23,8 +23,7 @@ from modelexpress_rl import (
 from torch import nn
 
 from prime_rl.configs.shared import ModelExpressWeightBroadcastConfig
-from prime_rl.transports.weights.base import SENDER_READY_MARKER, WeightReceiver, WeightSender
-from prime_rl.utils.modelexpress_trace import ReceiverTrace, publish_offer, record_phase
+from prime_rl.transports.weights.base import WeightReceiver, WeightSender
 from prime_rl.utils.pathing import wait_for_path
 
 VERSION_MARKER = ".mx_version"
@@ -45,7 +44,6 @@ class ModelExpressWeightSender(WeightSender):
         self._carrier: dict[str, str] = {}
         self._trainer_carrier: dict[str, str] = {}
         self._uid = ""
-        self._offer_interval: tuple[int, int] | None = None
 
     def _attributes(self, step: int, uid: str = "") -> dict:
         return {
@@ -82,38 +80,16 @@ class ModelExpressWeightSender(WeightSender):
             parent=self._trainer_carrier,
         )
 
-    def _publish_sender_ready(self, step: int, step_dir: Path) -> None:
-        try:
-            self._start_cycle(step)
-            if telemetry.enabled():
-                start = time.time_ns()
-                try:
-                    publish_offer(step_dir / SENDER_READY_MARKER, step, self._carrier)
-                except Exception as error:
-                    self.logger.warning(f"Cannot publish sender trace metadata: {error}")
-                    super()._publish_sender_ready(step, step_dir)
-                self._offer_interval = (start, time.time_ns())
-            else:
-                self._offer_interval = None
-                super()._publish_sender_ready(step, step_dir)
-        except BaseException as error:
-            self._finish(error)
-            raise
-
     def _wait_for_receiver_ready(self, step_dir: Path) -> None:
         step = int(step_dir.name.removeprefix("step_"))
         try:
+            self._start_cycle(step)
             with (
                 self._role.active(),
                 telemetry.refit_attributes(self._attributes(step), role="trainer", rank=self.world.rank),
+                telemetry.span("mx.refit.wait_receiver_ready", {"wait.marker": str(step_dir / ".receiver_ready")}),
             ):
-                with telemetry.span("mx.refit.wait_receiver_ready", {"wait.marker": str(step_dir / ".receiver_ready")}):
-                    super()._wait_for_receiver_ready(step_dir)
-                if self._offer_interval is not None:
-                    try:
-                        telemetry.completed_span("mx.refit.sender_offer", *self._offer_interval)
-                    except Exception as error:
-                        self.logger.warning(f"Cannot record sender offer telemetry: {error}")
+                super()._wait_for_receiver_ready(step_dir)
         except BaseException as error:
             self._finish(error)
             raise
@@ -261,22 +237,16 @@ class ModelExpressWeightSender(WeightSender):
 class ModelExpressWeightReceiver(WeightReceiver):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._trace_samples = {}
-
-    def next_version(self, current: int) -> int:
-        if not telemetry.enabled():
-            return super().next_version(current)
-        with record_phase(self._trace_samples, "receiver_scan") as attributes:
-            next_step = super().next_version(current)
-            attributes["step"] = next_step
-        return next_step
+        self._published_wait: tuple[int, int, int] | None = None
 
     async def wait_published(self, step: int, cancelled=None) -> None:
+        self._published_wait = None
         if not telemetry.enabled():
             await super().wait_published(step, cancelled=cancelled)
             return
-        with record_phase(self._trace_samples, "confirm_offer", {"step": step}):
-            await super().wait_published(step, cancelled=cancelled)
+        start = time.time_ns()
+        await super().wait_published(step, cancelled=cancelled)
+        self._published_wait = (step, start, time.time_ns())
 
     async def initialize(self) -> None:
         self._control = ModelExpressControlClient.connect(server_url=f"{self.config.host}:{self.config.port}")
@@ -291,23 +261,41 @@ class ModelExpressWeightReceiver(WeightReceiver):
         )
 
     async def receive(self, step: int) -> None:
-        samples, self._trace_samples = self._trace_samples, {}
-        with ReceiverTrace(step, self.step_dir(step), self.config.staging_mode, self.logger, samples) as trace:
-            with record_phase(trace.phases, "receiver_ack"):
-                self._ack(step)
-            marker = self.step_dir(step) / VERSION_MARKER
-            with record_phase(trace.phases, "wait_version_marker", {"wait.marker": str(marker)}):
-                await asyncio.wait_for(wait_for_path(marker, interval=0.01), timeout=self.config.timeout)
-                uid = marker.read_text()
-            with record_phase(trace.phases, "version_context_lookup"), telemetry.untraced():
-                version = await asyncio.to_thread(self._control.get_weight_version, uid)
-            carrier = version.trace_context
-            trace.attach(carrier, uid)
-            with (
-                trace.active(),
-                telemetry.refit_attributes(trace.attributes),
-            ):
-                await self._receive_version(step, uid, carrier, version)
+        published_wait, self._published_wait = self._published_wait, None
+        telemetry.configure("prime-rl-orchestrator")
+        attributes = {
+            "step": step,
+            "refit.step": step,
+            "refit.phase": "cold" if step == 0 else "warm",
+            "experiment": os.environ.get("MX_REFIT_EXPERIMENT", ""),
+            "staging_mode": self.config.staging_mode,
+            "refit.aggregate": True,
+        }
+        ack_start = time.time_ns()
+        self._ack(step)
+        ack_end = time.time_ns()
+        marker = self.step_dir(step) / VERSION_MARKER
+        wait_start = time.time_ns()
+        await asyncio.wait_for(wait_for_path(marker, interval=0.01), timeout=self.config.timeout)
+        uid = marker.read_text()
+        wait_end = time.time_ns()
+        lookup_start = time.time_ns()
+        with telemetry.untraced():
+            version = await asyncio.to_thread(self._control.get_weight_version, uid)
+        lookup_end = time.time_ns()
+        carrier = version.trace_context
+        attributes.update({"version_uid": uid, "refit.id": uid})
+        with (
+            telemetry.extracted(carrier),
+            telemetry.refit_attributes(attributes, role="orchestrator", rank=0),
+            telemetry.refit_span("mx.refit.orchestrator"),
+        ):
+            if published_wait is not None and published_wait[0] == step:
+                telemetry.completed_span("mx.refit.wait_published", *published_wait[1:])
+            telemetry.completed_span("mx.refit.receiver_ack", ack_start, ack_end)
+            telemetry.completed_span("mx.refit.wait_version_marker", wait_start, wait_end, {"wait.marker": str(marker)})
+            telemetry.completed_span("mx.refit.version_context_lookup", lookup_start, lookup_end)
+            await self._receive_version(step, uid, carrier, version)
 
     async def _receive_version(self, step: int, uid: str, carrier: dict, version) -> None:
         deadline = time.monotonic() + self.config.timeout

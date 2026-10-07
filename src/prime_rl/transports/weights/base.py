@@ -60,7 +60,7 @@ class WeightSender(ABC):
             # the consumer or the trainer on stale markers of a previous run.
             shutil.rmtree(step_dir, ignore_errors=True)
             step_dir.mkdir(parents=True)
-            self._publish_sender_ready(step, step_dir)
+            (step_dir / SENDER_READY_MARKER).touch()
             self._wait_for_receiver_ready(step_dir)
             (step_dir / STARTED_MARKER).touch()
         self._broadcast(model, step, step_dir)
@@ -71,9 +71,6 @@ class WeightSender(ABC):
 
     def step_dir(self, step: int) -> Path:
         return get_step_path(get_broadcast_dir(self.output_dir), step)
-
-    def _publish_sender_ready(self, step: int, step_dir: Path) -> None:
-        (step_dir / SENDER_READY_MARKER).touch()
 
     def _wait_for_receiver_ready(self, step_dir: Path) -> None:
         """Wait for the consumer to acknowledge the offered version. Bounded:
