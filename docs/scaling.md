@@ -304,6 +304,24 @@ W3C context. Resource attributes identify the experiment and run. Exporters are
 initialized in each worker process and flushed on shutdown. Without an OTLP
 endpoint, the additional instrumentation is inert.
 
+The MX client must support `telemetry.completed_span(..., error=...)` for receiver
+phase failures and cancellation. With tracing enabled, the sender atomically
+publishes the early cycle carrier in the existing `.sender_ready` marker, together
+with schema, step/run identity, host/clock identity and offer timestamps. The
+receiver validates that metadata and falls back to MX version metadata when the
+early carrier is unavailable or invalid. Handshake decisions still use marker
+existence, and other transports retain empty sender markers and no-op trace hooks.
+
+One `mx.refit.orchestrator` envelope covers each accepted update through policy
+advancement and the final observer/update-hook notification. Its children expose
+discovery, update-lock acquisition, offer confirmation, pending observers,
+scheduling-lock waits and stale-rollout cancellation counts. Duplicate updates
+do not create another successful envelope. Observer callbacks run without an
+active refit context so newly scheduled rollouts do not inherit the refit parent.
+Offer-to-discovery elapsed time and clipped polling sleep require matching host
+and monotonic clock identities; other placements retain raw timestamps and scan
+diagnostics. The watcher's default one-second polling interval is unchanged.
+
 ### NIXL weight broadcast
 
 Set `[weight_broadcast] type = "nixl"` to use receiver-driven NIXL weight transfer. Before the first SLURM run, install the NIXL/UCX build and the ModelExpress service binaries on the shared filesystem:

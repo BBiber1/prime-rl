@@ -3,6 +3,7 @@ import shutil
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import final
 
@@ -60,7 +61,7 @@ class WeightSender(ABC):
             # the consumer or the trainer on stale markers of a previous run.
             shutil.rmtree(step_dir, ignore_errors=True)
             step_dir.mkdir(parents=True)
-            (step_dir / SENDER_READY_MARKER).touch()
+            self._publish_sender_ready(step, step_dir)
             self._wait_for_receiver_ready(step_dir)
             (step_dir / STARTED_MARKER).touch()
         self._broadcast(model, step, step_dir)
@@ -71,6 +72,9 @@ class WeightSender(ABC):
 
     def step_dir(self, step: int) -> Path:
         return get_step_path(get_broadcast_dir(self.output_dir), step)
+
+    def _publish_sender_ready(self, step: int, step_dir: Path) -> None:
+        (step_dir / SENDER_READY_MARKER).touch()
 
     def _wait_for_receiver_ready(self, step_dir: Path) -> None:
         """Wait for the consumer to acknowledge the offered version. Bounded:
@@ -133,6 +137,15 @@ class WeightReceiver(ABC):
     async def initialize(self) -> None:
         """One-time transport bootstrap (rendezvous groups, sessions)."""
 
+    def trace_update(self, step: int):
+        return nullcontext()
+
+    def trace_accept(self) -> None:
+        """Accept the traced update after the watcher's duplicate-version check."""
+
+    def trace_phase(self, name: str, attributes: dict | None = None):
+        return nullcontext(dict(attributes or {}))
+
     def step_dir(self, step: int) -> Path:
         return get_step_path(self.broadcast_dir, step)
 
@@ -165,5 +178,6 @@ class WeightReceiver(ABC):
 
     async def sync_startup(self, step: int, timeout: float) -> None:
         """Rendezvous with the trainer's startup broadcast of v{step}."""
-        await asyncio.wait_for(self.wait_published(step), timeout=timeout)
+        with self.trace_phase("confirm_offer"):
+            await asyncio.wait_for(self.wait_published(step), timeout=timeout)
         await self.receive(step)
