@@ -229,7 +229,9 @@ class ModelExpressWeightSender(WeightSender):
                     with telemetry.span("mx.refit.wait_installed", {"wait.marker": str(installed)}):
                         while not installed.exists():
                             if time.monotonic() >= deadline:
-                                raise TimeoutError(f"Inference did not install version {self._uid} within {self.timeout}s")
+                                raise TimeoutError(
+                                    f"Inference did not install version {self._uid} within {self.timeout}s"
+                                )
                             time.sleep(0.1)
                         if installed.read_text() != self._uid:
                             raise RuntimeError("Inference acknowledged a different weight version")
@@ -320,9 +322,7 @@ class ModelExpressWeightReceiver(WeightReceiver):
                 await asyncio.sleep(0.1)
                 version = await asyncio.to_thread(self._control.get_weight_version, uid)
         with telemetry.span("mx.refit.inference_update"):
-            await self.admin_plane.update_modelexpress_weights(
-                version_uid=uid, step=step, trace_context=carrier
-            )
+            await self.admin_plane.update_modelexpress_weights(version_uid=uid, step=step, trace_context=carrier)
         with telemetry.span("mx.refit.retire"):
             await asyncio.to_thread(self._control.delete_weight_version, uid)
         with telemetry.span("mx.refit.installed_marker_publish"):

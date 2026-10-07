@@ -239,7 +239,9 @@ class AdminPlane:
             error = None
             try:
                 with telemetry.span("mx.refit.update_weights_rpc"):
-                    results = await asyncio.gather(*(install(client) for client in self.clients), return_exceptions=True)
+                    results = await asyncio.gather(
+                        *(install(client) for client in self.clients), return_exceptions=True
+                    )
                 for result in results:
                     if isinstance(result, BaseException):
                         raise result
@@ -250,7 +252,6 @@ class AdminPlane:
                 raise
             finally:
                 generators.finish(error)
-
 
     async def initialize_modelexpress(
         self,

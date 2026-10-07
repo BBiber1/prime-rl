@@ -103,7 +103,16 @@ def test_modelexpress_installation_outcome_reaches_non_master_without_shared_sto
     sender = next(
         node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "ModelExpressWeightSender"
     )
-    broadcast = next(node for node in sender.body if isinstance(node, ast.FunctionDef) and node.name == "_broadcast")
+    broadcast = next(
+        node for node in sender.body if isinstance(node, ast.FunctionDef) and node.name == "_publish_and_wait"
+    )
+
+    class StripTelemetry(ast.NodeTransformer):
+        def visit_With(self, node):
+            self.generic_visit(node)
+            return node.body
+
+    broadcast = StripTelemetry().visit(broadcast)
     publication = next(
         index
         for index, node in enumerate(broadcast.body)
@@ -146,6 +155,7 @@ def test_modelexpress_installation_outcome_reaches_non_master_without_shared_sto
         sender = SimpleNamespace(
             world=SimpleNamespace(is_master=rank == 0),
             timeout=0,
+            _uid="version-a",
             _trainer=SimpleNamespace(release_version=lambda **kwargs: calls.append((rank, "release"))),
         )
         step_dir = tmp_path if rank == 0 else tmp_path / "non_master_local_fs"
