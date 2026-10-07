@@ -1,5 +1,6 @@
 """Bounded phase timing without installing a tracing context on application tasks."""
 
+import asyncio
 import json
 import os
 import re
@@ -98,6 +99,8 @@ class PhaseSession:
     pending: deque[Phase] = field(default_factory=lambda: deque(maxlen=32))
     emit: Callable[[Phase], None] | None = None
     dropped: int = 0
+    task: asyncio.Task | None = None
+    active: bool = True
 
 
 class PhaseRecorder:
@@ -109,10 +112,16 @@ class PhaseRecorder:
     @contextmanager
     def session(self) -> Iterator[PhaseSession]:
         session = PhaseSession()
+        try:
+            session.task = asyncio.current_task()
+        except RuntimeError:
+            pass
         token = self.current.set(session)
         try:
             yield session
         finally:
+            session.active = False
+            session.emit = None
             session.pending.clear()
             self.current.reset(token)
 
@@ -128,10 +137,12 @@ class PhaseRecorder:
     @contextmanager
     def phase(self, name: str, attributes: dict | None = None) -> Iterator[dict]:
         attrs = dict(attributes or {})
-        if not self.enabled():
+        session = self.current.get()
+        if session is not None and not session.active:
+            session = None
+        if not self.enabled() or (session is None and name not in {"watcher_scan", "watcher_poll_sleep"}):
             yield attrs
             return
-        session = self.current.get()
         start, mono_start = time_ns(), monotonic_ns()
         error = None
         try:

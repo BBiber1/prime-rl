@@ -23,6 +23,7 @@ import asyncio
 import os
 import time
 import uuid
+from functools import partial
 from typing import TYPE_CHECKING
 
 import verifiers.v1 as vf
@@ -324,7 +325,14 @@ class Orchestrator:
         log_interval = config.log.interval
 
         self.concurrency = ConcurrencyController(config.concurrency, fallback_cost=config.seq_len)
-        self.dispatcher = Dispatcher(
+        dispatcher_factory = Dispatcher
+        watcher_class = WeightWatcher
+        if config.weight_broadcast.type == "modelexpress":
+            from prime_rl.orchestrator.modelexpress import ModelExpressDispatcher, ModelExpressWeightWatcher
+
+            dispatcher_factory = partial(ModelExpressDispatcher, receiver=self.receiver)
+            watcher_class = ModelExpressWeightWatcher
+        self.dispatcher = dispatcher_factory(
             train_envs=self.train_envs,
             eval_envs=self.eval_envs,
             train_source=self.train_source,
@@ -339,7 +347,6 @@ class Orchestrator:
             run_id=self.run_id,
             run_name=self.run_name,
             on_episode_complete=self.concurrency.record_episode,
-            trace_phase=self.receiver.trace_phase,
         )
         self.concurrency.bind(
             set_limit=self.dispatcher.set_limit,
@@ -368,7 +375,7 @@ class Orchestrator:
         )
 
         self.eval_sink = EvalSink(eval_envs=self.eval_envs) if self.eval_envs is not None else None
-        self.watcher = WeightWatcher(
+        self.watcher = watcher_class(
             self.receiver,
             policy=self.policy,
             observers=[self.dispatcher],
