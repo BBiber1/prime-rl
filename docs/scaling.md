@@ -313,17 +313,26 @@ publishes the early cycle carrier in the existing `.sender_ready` marker, togeth
 with schema, step/run identity, host/clock identity and offer timestamps. The
 receiver validates that metadata and falls back to MX version metadata when the
 early carrier is unavailable or invalid. Handshake decisions still use marker
-existence, and other transports retain empty sender markers and no-op trace hooks.
+existence, and other transports retain empty sender markers. The base sender adds
+only a publication hook; receiver tracing stays in the MX implementation.
 
 One `mx.refit.orchestrator` envelope covers each accepted update through policy
 advancement and the final observer/update-hook notification. Its children expose
-discovery, update-lock acquisition, offer confirmation, pending observers,
-scheduling-lock waits and stale-rollout cancellation counts. Duplicate updates
+discovery, update-lock acquisition, offer confirmation, the MX pending observer,
+scheduling-lock waits and stale-rollout cancellation counts. The orchestrator
+selects MX-specific watcher and dispatcher subclasses for this transport. Their
+update and cancellation overrides delegate to the standard implementation;
+the generic watcher and dispatcher have no tracing changes. Duplicate updates
 do not create another successful envelope. Observer callbacks run without an
 active refit context so newly scheduled rollouts do not inherit the refit parent.
 Offer-to-discovery elapsed time and clipped polling sleep require matching host
 and monotonic clock identities; other placements retain raw timestamps and scan
 diagnostics. The watcher's default one-second polling interval is unchanged.
+Policy advancement is included in `watcher_update` / `startup_update`; there is
+no separate policy-advance span. Cancellation records attempted stale groups and
+successfully cancelled episodes, retaining partial counts on failure. Lock
+tracing is restricted to the update task, and closed tracing sessions are inert
+in inherited rollout tasks.
 
 ### NIXL weight broadcast
 

@@ -3,7 +3,6 @@ import shutil
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from contextlib import nullcontext
 from pathlib import Path
 from typing import final
 
@@ -137,15 +136,6 @@ class WeightReceiver(ABC):
     async def initialize(self) -> None:
         """One-time transport bootstrap (rendezvous groups, sessions)."""
 
-    def trace_update(self, step: int):
-        return nullcontext()
-
-    def trace_accept(self) -> None:
-        """Accept the traced update after the watcher's duplicate-version check."""
-
-    def trace_phase(self, name: str, attributes: dict | None = None):
-        return nullcontext(dict(attributes or {}))
-
     def step_dir(self, step: int) -> Path:
         return get_step_path(self.broadcast_dir, step)
 
@@ -178,6 +168,5 @@ class WeightReceiver(ABC):
 
     async def sync_startup(self, step: int, timeout: float) -> None:
         """Rendezvous with the trainer's startup broadcast of v{step}."""
-        with self.trace_phase("confirm_offer"):
-            await asyncio.wait_for(self.wait_published(step), timeout=timeout)
+        await asyncio.wait_for(self.wait_published(step), timeout=timeout)
         await self.receive(step)

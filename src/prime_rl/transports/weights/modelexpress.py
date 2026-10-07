@@ -25,7 +25,7 @@ from torch import nn
 
 from prime_rl.configs.shared import ModelExpressWeightBroadcastConfig
 from prime_rl.transports.weights.base import SENDER_READY_MARKER, WeightReceiver, WeightSender
-from prime_rl.utils.modelexpress_trace import ReceiverTracing
+from prime_rl.utils.modelexpress_trace import ReceiverTracing, RefitLock
 from prime_rl.utils.pathing import wait_for_path
 from prime_rl.utils.weight_trace import publish_offer
 
@@ -275,6 +275,22 @@ class ModelExpressWeightReceiver(WeightReceiver):
 
     def trace_update(self, step: int):
         return self._updates.trace_update(step)
+
+    def trace_lock(self, phase: str):
+        return RefitLock(self._updates, phase)
+
+    async def wait_published(self, step: int, cancelled=None) -> None:
+        if self._updates.current is not None:
+            self.trace_accept()
+        with self.trace_phase("confirm_offer"):
+            await super().wait_published(step, cancelled=cancelled)
+
+    async def sync_startup(self, step: int, timeout: float) -> None:
+        if self._updates.current is None:
+            with self.trace_update(step):
+                await self.sync_startup(step, timeout)
+            return
+        await super().sync_startup(step, timeout)
 
     async def initialize(self) -> None:
         self._control = ModelExpressControlClient.connect(server_url=f"{self.config.host}:{self.config.port}")

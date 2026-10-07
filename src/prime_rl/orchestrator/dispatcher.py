@@ -31,7 +31,6 @@ import traceback
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Literal
@@ -145,7 +144,6 @@ class Dispatcher:
         run_id: str,
         run_name: str | None,
         on_episode_complete: Callable[[int], None] | None = None,
-        trace_phase: Callable | None = None,
     ) -> None:
         self.policy = policy
         self.progress = progress
@@ -161,7 +159,6 @@ class Dispatcher:
         self.run_name = run_name
         # Called with ``total_tokens`` per completed episode
         self.on_episode_complete = on_episode_complete
-        self.trace_phase = trace_phase or (lambda name, attributes=None: nullcontext(dict(attributes or {})))
 
         # Starting value of the dynamic cap (the concurrency controller moves
         # it); ``max_inflight_ceiling`` is the configured hard maximum, used to
@@ -416,28 +413,22 @@ class Dispatcher:
         self.policy_update_pending = True
         # Wait for a scheduling call that started before the pending update.
         # No rollout can cross the inference weight swap after this barrier.
-        with self.trace_phase("wait_scheduling_lock"):
-            async with self.scheduling_lock:
-                pass
+        async with self.scheduling_lock:
+            pass
 
         if self.train_envs is None or self.progress is None:
             return
-        with self.trace_phase("cancel_stale_rollouts") as attributes:
-            min_version = min_fresh_version(self.progress.step, self.max_off_policy_steps)
-            stale_groups = [
-                gid
-                for gid, group in self.groups.items()
-                if group.kind == "train"
-                and self.train_envs.get(group.env_name).generation_source.uses_live_policy
-                and group.policy_version_at_start < min_version
-            ]
-            cancelled = 0
-            attributes.update({"rollout.min_version": min_version, "rollout.stale_groups": len(stale_groups)})
-            try:
-                for gid in stale_groups:
-                    cancelled += await self.drop_group(gid, reason="stale")
-            finally:
-                attributes["rollout.cancelled_episodes"] = cancelled
+        min_version = min_fresh_version(self.progress.step, self.max_off_policy_steps)
+        stale_groups = [
+            gid
+            for gid, group in self.groups.items()
+            if group.kind == "train"
+            and self.train_envs.get(group.env_name).generation_source.uses_live_policy
+            and group.policy_version_at_start < min_version
+        ]
+        cancelled = 0
+        for gid in stale_groups:
+            cancelled += await self.drop_group(gid, reason="stale")
 
         if cancelled:
             get_logger().warning(

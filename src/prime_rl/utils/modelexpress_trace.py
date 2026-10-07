@@ -1,7 +1,9 @@
 """ModelExpress receiver trace lifetime, independent of training and inference runtimes."""
 
+import asyncio
 import os
-from contextlib import contextmanager
+from collections.abc import Callable
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
@@ -109,4 +111,38 @@ class ReceiverTracing:
 
     @property
     def current(self) -> ReceiverTrace | None:
-        return self._trace.get()
+        session = self._phases.current.get()
+        return self._trace.get() if session is not None and session.active else None
+
+
+class RefitLock(asyncio.Lock):
+    def __init__(self, tracing: ReceiverTracing, phase: str):
+        super().__init__()
+        self.tracing = tracing
+        self.phase = phase
+
+    async def acquire(self) -> bool:
+        session = self.tracing._phases.current.get()
+        if session is None or session.task is not asyncio.current_task():
+            return await super().acquire()
+        with self.tracing.trace_phase(self.phase):
+            return await super().acquire()
+
+
+@dataclass
+class CancellationTrace:
+    stack: ExitStack
+    trace_phase: Callable
+    attributes: dict | None = None
+    minimum: int | None = None
+
+    async def record_group(self, drop_group, group_id, reason) -> int:
+        if self.attributes is None:
+            attributes = {"rollout.attempted_groups": 0, "rollout.cancelled_episodes": 0}
+            if self.minimum is not None:
+                attributes["rollout.min_version"] = self.minimum
+            self.attributes = self.stack.enter_context(self.trace_phase("cancel_stale_rollouts", attributes))
+        self.attributes["rollout.attempted_groups"] += 1
+        count = await drop_group(group_id, reason=reason)
+        self.attributes["rollout.cancelled_episodes"] += count
+        return count
