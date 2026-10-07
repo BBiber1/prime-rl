@@ -47,6 +47,7 @@ class ModelExpressWeightSender(WeightSender):
         self._carrier: dict[str, str] = {}
         self._trainer_carrier: dict[str, str] = {}
         self._uid = ""
+        self._offer_interval: tuple[int, int] | None = None
 
     def _attributes(self, step: int, uid: str = "") -> dict:
         return {
@@ -86,15 +87,17 @@ class ModelExpressWeightSender(WeightSender):
     def _publish_sender_ready(self, step: int, step_dir: Path) -> None:
         try:
             self._start_cycle(step)
-            with (
-                self._role.active(),
-                telemetry.refit_attributes(self._attributes(step), role="trainer", rank=self.world.rank),
-                telemetry.span("mx.refit.sender_offer"),
-            ):
-                if telemetry.enabled():
+            if telemetry.enabled():
+                start = time.time_ns()
+                try:
                     publish_offer(step_dir / SENDER_READY_MARKER, step, self._carrier)
-                else:
+                except Exception as error:
+                    self.logger.warning(f"Cannot publish sender trace metadata: {error}")
                     super()._publish_sender_ready(step, step_dir)
+                self._offer_interval = (start, time.time_ns())
+            else:
+                self._offer_interval = None
+                super()._publish_sender_ready(step, step_dir)
         except BaseException as error:
             self._finish(error)
             raise
@@ -105,9 +108,14 @@ class ModelExpressWeightSender(WeightSender):
             with (
                 self._role.active(),
                 telemetry.refit_attributes(self._attributes(step), role="trainer", rank=self.world.rank),
-                telemetry.span("mx.refit.wait_receiver_ready", {"wait.marker": str(step_dir / ".receiver_ready")}),
             ):
-                super()._wait_for_receiver_ready(step_dir)
+                with telemetry.span("mx.refit.wait_receiver_ready", {"wait.marker": str(step_dir / ".receiver_ready")}):
+                    super()._wait_for_receiver_ready(step_dir)
+                if self._offer_interval is not None:
+                    try:
+                        telemetry.completed_span("mx.refit.sender_offer", *self._offer_interval)
+                    except Exception as error:
+                        self.logger.warning(f"Cannot record sender offer telemetry: {error}")
         except BaseException as error:
             self._finish(error)
             raise
@@ -258,13 +266,18 @@ class ModelExpressWeightReceiver(WeightReceiver):
         self._updates = ReceiverTracing(self.step_dir, self.config.staging_mode, self.logger)
 
     def next_version(self, current: int) -> int:
+        if not telemetry.enabled():
+            return super().next_version(current)
         with self._updates.trace_phase("receiver_scan") as attributes:
             next_step = super().next_version(current)
             attributes["step"] = next_step
         return next_step
 
     async def wait_published(self, step: int, cancelled=None) -> None:
-        with self._updates.trace_update(step), self._updates.trace_phase("confirm_offer"):
+        if not telemetry.enabled():
+            await super().wait_published(step, cancelled=cancelled)
+            return
+        with self._updates.trace_phase("confirm_offer", {"step": step}):
             await super().wait_published(step, cancelled=cancelled)
 
     async def initialize(self) -> None:
@@ -282,7 +295,7 @@ class ModelExpressWeightReceiver(WeightReceiver):
     async def receive(self, step: int) -> None:
         with self._updates.trace_update(step):
             state = self._updates.current
-            self._updates.trace_accept()
+            state.accepted = True
             with self._updates.trace_phase("receiver_ack"):
                 self._ack(step)
             marker = self.step_dir(step) / VERSION_MARKER
@@ -293,11 +306,8 @@ class ModelExpressWeightReceiver(WeightReceiver):
                 version = await asyncio.to_thread(self._control.get_weight_version, uid)
             carrier = version.trace_context
             state.uid = uid
-            if not state.carrier:
-                state.carrier = carrier
-                self._updates.trace_accept()
-            if state.role is not None:
-                state.role.set_attributes({"version_uid": uid, "refit.id": uid})
+            state.carrier = carrier
+            self._updates.trace_accept()
             with (
                 state.role.active() if state.role is not None else nullcontext(),
                 telemetry.refit_attributes(self._updates.attributes(state)),

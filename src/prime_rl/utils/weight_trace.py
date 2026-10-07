@@ -134,7 +134,7 @@ class PhaseRecorder:
         session = self.current.get()
         if session is not None and not session.active:
             session = None
-        if not self.enabled() or (session is None and name != "receiver_scan"):
+        if not self.enabled() or (session is None and name not in {"receiver_scan", "confirm_offer"}):
             yield attrs
             return
         start, mono_start = time_ns(), monotonic_ns()
@@ -153,15 +153,19 @@ class PhaseRecorder:
                     if len(session.pending) == session.pending.maxlen:
                         session.dropped += 1
                     session.pending.append(phase)
-            elif name == "receiver_scan":
+            elif name in {"receiver_scan", "confirm_offer"}:
                 self.poll[name] = phase
 
 
 def discovery_phases(offer: dict, poll: dict[str, Phase], local_identity: tuple[str, str]) -> list[Phase]:
     """Derive offer latency only when sender and receiver share a monotonic clock."""
+    confirmation = poll.get("confirm_offer")
+    phases = (
+        [confirmation] if confirmation is not None and confirmation.attributes.get("step") == offer.get("step") else []
+    )
     scan = poll.get("receiver_scan")
     if scan is None or scan.attributes.get("step") != offer.get("step"):
-        return []
+        return phases
     host, clock = local_identity
     shared = bool(clock) and offer.get("sender_host") == host and offer.get("clock_id") == clock
     offered = offer.get("offered_at_monotonic_ns")
@@ -175,8 +179,9 @@ def discovery_phases(offer: dict, poll: dict[str, Phase], local_identity: tuple[
         },
     }
     if not shared or not isinstance(offered, int) or offered > scan.monotonic_end:
-        return [Phase(scan.name, scan.start, scan.end, scan.monotonic_start, scan.monotonic_end, attrs, scan.error)]
-    phases = []
+        return phases + [
+            Phase(scan.name, scan.start, scan.end, scan.monotonic_start, scan.monotonic_end, attrs, scan.error)
+        ]
     begin, end = max(offered, scan.monotonic_start), scan.monotonic_end
     phases.append(
         Phase(

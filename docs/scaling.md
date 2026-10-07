@@ -317,8 +317,8 @@ The MX receiver overrides `next_version` and `wait_published` to record
 `receiver_scan` and `confirm_offer` without changing discovery or handshake
 decisions. The generic watcher, dispatcher and orchestrator have no tracing
 changes or transport-specific subclasses. The default polling intervals remain
-unchanged. Offer confirmation is exported beneath the trainer cycle when early
-context is available; it does not create a reception envelope. One
+unchanged. Scan and confirmation only buffer timestamps; their spans are
+exported under the reception envelope after the version-context lookup. One
 `mx.refit.orchestrator` envelope covers each receiver invocation through the
 installation marker, including ACK, version-marker wait and context lookup.
 Recorded discovery phases extend that envelope retrospectively.
@@ -331,6 +331,18 @@ notifications are not separately instrumented. In particular, an interval
 between confirmation and receiver entry cannot establish which observer or
 scheduling activity caused the delay. The receiver closes its trace context
 before the watcher resumes and schedules new rollouts.
+
+The receiver publishes its ACK, waits for the version marker and looks up the
+version before reading sender trace metadata or exporting additional phases.
+Metadata is read at most once per reception. Disabled scan/confirmation paths
+delegate directly to the base receiver. Sender metadata publication failure
+falls back to the empty marker; optional receiver phase/envelope failures are
+logged without replacing operation errors. Sender-offer timing is exported
+after the readiness wait. The changes add no polling, locks, collectives, RPCs,
+exporter flushes or transfer-completion barriers. The MX facade uses its existing
+batch exporter. Enabled tracing still costs timestamp capture, JSON marker I/O
+and span bookkeeping; unchanged end-to-end performance requires an enabled vs
+disabled comparison with the same workload and placement.
 
 ### NIXL weight broadcast
 
