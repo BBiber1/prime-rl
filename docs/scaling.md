@@ -316,23 +316,24 @@ early carrier is unavailable or invalid. Handshake decisions still use marker
 existence, and other transports retain empty sender markers. The base sender adds
 only a publication hook; receiver tracing stays in the MX implementation.
 
-One `mx.refit.orchestrator` envelope covers each accepted update through policy
-advancement and the final observer/update-hook notification. Its children expose
-discovery, update-lock acquisition, offer confirmation, the MX pending observer,
-scheduling-lock waits and stale-rollout cancellation counts. The orchestrator
-selects MX-specific watcher and dispatcher subclasses for this transport. Their
-update and cancellation overrides delegate to the standard implementation;
-the generic watcher and dispatcher have no tracing changes. Duplicate updates
-do not create another successful envelope. Observer callbacks run without an
-active refit context so newly scheduled rollouts do not inherit the refit parent.
-Offer-to-discovery elapsed time and clipped polling sleep require matching host
-and monotonic clock identities; other placements retain raw timestamps and scan
-diagnostics. The watcher's default one-second polling interval is unchanged.
-Policy advancement is included in `watcher_update` / `startup_update`; there is
-no separate policy-advance span. Cancellation records attempted stale groups and
-successfully cancelled episodes, retaining partial counts on failure. Lock
-tracing is restricted to the update task, and closed tracing sessions are inert
-in inherited rollout tasks.
+The MX receiver overrides `next_version` and `wait_published` to record
+`receiver_scan` and `confirm_offer` without changing discovery or handshake
+decisions. The generic watcher, dispatcher and orchestrator have no tracing
+changes or transport-specific subclasses. The default polling intervals remain
+unchanged. Offer confirmation is exported beneath the trainer cycle when early
+context is available; it does not create a reception envelope. One
+`mx.refit.orchestrator` envelope covers each receiver invocation through the
+installation marker, including ACK, version-marker wait and context lookup.
+Recorded discovery phases extend that envelope retrospectively.
+
+Offer-to-discovery elapsed time requires matching host and monotonic clock
+identities and a scan for the same step. Other placements retain raw sender
+timestamps and scan diagnostics. Watcher sleep, update-lock acquisition,
+dispatcher scheduling/cancellation, policy advancement and post-update
+notifications are not separately instrumented. In particular, an interval
+between confirmation and receiver entry cannot establish which observer or
+scheduling activity caused the delay. The receiver closes its trace context
+before the watcher resumes and schedules new rollouts.
 
 ### NIXL weight broadcast
 
