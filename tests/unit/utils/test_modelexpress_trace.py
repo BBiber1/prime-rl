@@ -100,17 +100,20 @@ def refit_trace(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("startup", [False, True])
 @pytest.mark.asyncio
-async def test_receiver_envelope_and_confirmation_do_not_leak_context(refit_trace, legacy, monkeypatch):
+async def test_receiver_envelope_and_confirmation_do_not_leak_context(refit_trace, legacy, startup, monkeypatch):
     root, carrier, step_dir, exporter, logger, _ = refit_trace
+    monkeypatch.setattr(modelexpress_trace, "clock_identity", lambda: ("host", "boot/ns"))
     marker = step_dir / ".sender_ready"
     if legacy:
         marker.touch()
     else:
         publish_offer(marker, 3, carrier)
     samples = {}
-    with record_phase(samples, "receiver_scan", {"step": 3}):
-        pass
+    if not startup:
+        with record_phase(samples, "receiver_scan", {"step": 3}):
+            pass
     metadata_reads = []
     lookup_done = []
     original_read = modelexpress_trace.read_offer
@@ -154,6 +157,11 @@ async def test_receiver_envelope_and_confirmation_do_not_leak_context(refit_trac
     assert any(s.name == "mx.refit.receiver_ack" for s in children)
     confirmation = next(s for s in spans if s.name == "mx.refit.confirm_offer")
     assert confirmation.parent.span_id == role.context.span_id
+    assert role.start_time == confirmation.start_time == samples["confirm_offer"].start
+    discovery = [s for s in spans if s.name in {"mx.refit.receiver_scan", "mx.refit.offer_to_discovery"}]
+    assert len(discovery) == (0 if startup else 1 if legacy else 2)
+    assert all(s.parent.span_id == cycle.context.span_id for s in discovery)
+    assert all(s.context.trace_id == cycle.context.trace_id for s in discovery)
 
 
 @pytest.mark.parametrize("phase", ["receiver_ack", "wait_version_marker", "version_context_lookup"])
@@ -174,6 +182,7 @@ def test_early_failure_is_correlated_and_cleans_up(refit_trace, phase, failure):
     assert child.attributes["status"] == ("cancelled" if isinstance(failure, asyncio.CancelledError) else "failed")
     role = next(s for s in spans if s.name == "mx.refit.orchestrator")
     assert role.status.status_code == trace.StatusCode.ERROR
+    assert role.start_time == child.start_time
     assert child.parent.span_id == role.context.span_id
     assert not trace.get_current_span().get_span_context().is_valid
 

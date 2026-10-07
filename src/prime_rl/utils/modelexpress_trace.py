@@ -203,7 +203,11 @@ class ReceiverTrace:
 
     def _emit(self, name: str, phase: Phase) -> None:
         try:
-            with self.active(), telemetry.refit_attributes(self.attributes):
+            # Discovery precedes wait_published and belongs directly to the cycle.
+            parent = (
+                telemetry.extracted(self.carrier) if name in {"receiver_scan", "offer_to_discovery"} else self.active()
+            )
+            with parent, telemetry.refit_attributes(self.attributes):
                 telemetry.completed_span(
                     f"mx.refit.{name}", phase.start, phase.end, phase.attributes, error=phase.error
                 )
