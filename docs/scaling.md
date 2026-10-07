@@ -320,11 +320,16 @@ The MX receiver overrides `next_version` and `wait_published` to record
 `receiver_scan` and `confirm_offer` without changing discovery or handshake
 decisions. The generic watcher, dispatcher and orchestrator have no tracing
 changes or transport-specific subclasses. The default polling intervals remain
-unchanged. Scan and confirmation only buffer timestamps; their spans are
+unchanged. Scan and confirmation store their latest timings by phase name;
+one MX-specific helper holds the marker metadata and a per-reception trace
+object. There is no generic recorder or context-local session. Their spans are
 exported under the reception envelope after the version-context lookup. One
 `mx.refit.orchestrator` envelope covers each receiver invocation through the
 installation marker, including ACK, version-marker wait and context lookup.
-Recorded discovery phases extend that envelope retrospectively.
+The span is created after that lookup returns its trace carrier. Its exported
+start and end times come from its child spans, so recorded scan, confirmation
+and ACK timings can move its displayed start earlier. A failure before lookup
+can instead create the span while unwinding, using the early sender carrier.
 
 Offer-to-discovery elapsed time requires matching host and monotonic clock
 identities and a scan for the same step. Other placements retain raw sender

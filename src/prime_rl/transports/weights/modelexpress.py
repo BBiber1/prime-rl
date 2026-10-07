@@ -5,7 +5,6 @@ import atexit
 import os
 import time
 import uuid
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -25,9 +24,8 @@ from torch import nn
 
 from prime_rl.configs.shared import ModelExpressWeightBroadcastConfig
 from prime_rl.transports.weights.base import SENDER_READY_MARKER, WeightReceiver, WeightSender
-from prime_rl.utils.modelexpress_trace import ReceiverTracing
+from prime_rl.utils.modelexpress_trace import ReceiverTrace, publish_offer, record_phase
 from prime_rl.utils.pathing import wait_for_path
-from prime_rl.utils.weight_trace import publish_offer
 
 VERSION_MARKER = ".mx_version"
 INSTALLED_MARKER = ".installed"
@@ -273,12 +271,12 @@ class ModelExpressWeightSender(WeightSender):
 class ModelExpressWeightReceiver(WeightReceiver):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._updates = ReceiverTracing(self.step_dir, self.config.staging_mode, self.logger)
+        self._trace_samples = {}
 
     def next_version(self, current: int) -> int:
         if not telemetry.enabled():
             return super().next_version(current)
-        with self._updates.trace_phase("receiver_scan") as attributes:
+        with record_phase(self._trace_samples, "receiver_scan") as attributes:
             next_step = super().next_version(current)
             attributes["step"] = next_step
         return next_step
@@ -287,7 +285,7 @@ class ModelExpressWeightReceiver(WeightReceiver):
         if not telemetry.enabled():
             await super().wait_published(step, cancelled=cancelled)
             return
-        with self._updates.trace_phase("confirm_offer", {"step": step}):
+        with record_phase(self._trace_samples, "confirm_offer", {"step": step}):
             await super().wait_published(step, cancelled=cancelled)
 
     async def initialize(self) -> None:
@@ -303,24 +301,21 @@ class ModelExpressWeightReceiver(WeightReceiver):
         )
 
     async def receive(self, step: int) -> None:
-        with self._updates.trace_update(step):
-            state = self._updates.current
-            state.accepted = True
-            with self._updates.trace_phase("receiver_ack"):
+        samples, self._trace_samples = self._trace_samples, {}
+        with ReceiverTrace(step, self.step_dir(step), self.config.staging_mode, self.logger, samples) as trace:
+            with record_phase(trace.phases, "receiver_ack"):
                 self._ack(step)
             marker = self.step_dir(step) / VERSION_MARKER
-            with self._updates.trace_phase("wait_version_marker", {"wait.marker": str(marker)}):
+            with record_phase(trace.phases, "wait_version_marker", {"wait.marker": str(marker)}):
                 await asyncio.wait_for(wait_for_path(marker, interval=0.01), timeout=self.config.timeout)
                 uid = marker.read_text()
-            with self._updates.trace_phase("version_context_lookup"), telemetry.untraced():
+            with record_phase(trace.phases, "version_context_lookup"), telemetry.untraced():
                 version = await asyncio.to_thread(self._control.get_weight_version, uid)
             carrier = version.trace_context
-            state.uid = uid
-            state.carrier = carrier
-            self._updates.trace_accept()
+            trace.attach(carrier, uid)
             with (
-                state.role.active() if state.role is not None else nullcontext(),
-                telemetry.refit_attributes(self._updates.attributes(state)),
+                trace.active(),
+                telemetry.refit_attributes(trace.attributes),
             ):
                 await self._receive_version(step, uid, carrier, version)
 

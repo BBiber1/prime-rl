@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 
@@ -14,8 +15,68 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from prime_rl.utils import modelexpress_trace
-from prime_rl.utils.modelexpress_trace import ReceiverTracing
-from prime_rl.utils.weight_trace import publish_offer
+from prime_rl.utils.modelexpress_trace import (
+    Phase,
+    ReceiverTrace,
+    discovery_phase,
+    publish_offer,
+    read_offer,
+    record_phase,
+)
+
+CARRIER = {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01"}
+
+
+def test_offer_marker_is_atomic_and_validated(tmp_path, monkeypatch):
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "mx.experiment.run_id=test-run")
+    marker = tmp_path / ".sender_ready"
+    publish_offer(marker, 3, CARRIER)
+    offer = read_offer(marker, 3)
+    assert offer["trace_context"] == CARRIER and offer["run_id"] == "test-run"
+    assert not marker.with_suffix(".pending").exists()
+    with pytest.raises(ValueError, match="step/run"):
+        read_offer(marker, 4)
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "mx.experiment.run_id=other-run")
+    with pytest.raises(ValueError, match="step/run"):
+        read_offer(marker, 3)
+    marker.write_text("")
+    assert read_offer(marker, 3) is None
+    marker.unlink()
+    assert read_offer(marker, 3) is None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"schema_version": 2},
+        {"schema_version": True},
+        {"step": True},
+        {"trace_context": {"traceparent": "malformed"}},
+        {"trace_context": {"traceparent": "00-" + "0" * 32 + "-" + "2" * 16 + "-01"}},
+        {"trace_context": []},
+        {"offered_at_monotonic_ns": -1},
+        {"sender_host": 1},
+    ],
+)
+def test_invalid_offer_is_rejected(tmp_path, mutation):
+    marker = tmp_path / ".sender_ready"
+    publish_offer(marker, 3, CARRIER)
+    offer = json.loads(marker.read_text())
+    marker.write_text(json.dumps({**offer, **mutation}))
+    with pytest.raises(ValueError):
+        read_offer(marker, 3)
+
+
+def test_discovery_latency_requires_shared_clock_and_matching_step():
+    scan = Phase(200, 220, 130, {"step": 3})
+    offer = {"step": 3, "sender_host": "host", "clock_id": "boot/ns", "offered_at_monotonic_ns": 60}
+    elapsed = discovery_phase(offer, scan, ("host", "boot/ns"))
+    assert (elapsed.start, elapsed.end) == (150, 220)
+    assert (scan.start, scan.end) == (200, 220)
+    for identity in (("other-host", "boot/ns"), ("host", "other-ns"), ("host", "")):
+        assert discovery_phase(offer, scan, identity) is None
+    assert discovery_phase({**offer, "offered_at_monotonic_ns": 140}, scan, ("host", "boot/ns")) is None
+    assert discovery_phase({**offer, "step": 4}, scan, ("host", "boot/ns")) is None
 
 
 @pytest.fixture
@@ -32,8 +93,8 @@ def refit_trace(tmp_path, monkeypatch):
     step_dir = tmp_path / "step_3"
     step_dir.mkdir()
     warnings = []
-    receiver = ReceiverTracing(lambda step: step_dir, "H2D", SimpleNamespace(warning=warnings.append))
-    yield receiver, root, carrier, step_dir, exporter, warnings
+    logger = SimpleNamespace(warning=warnings.append)
+    yield root, carrier, step_dir, exporter, logger, warnings
     root.finish()
     provider.shutdown()
 
@@ -41,43 +102,39 @@ def refit_trace(tmp_path, monkeypatch):
 @pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.asyncio
 async def test_receiver_envelope_and_confirmation_do_not_leak_context(refit_trace, legacy, monkeypatch):
-    receiver, root, carrier, step_dir, exporter, _ = refit_trace
+    root, carrier, step_dir, exporter, logger, _ = refit_trace
     marker = step_dir / ".sender_ready"
     if legacy:
         marker.touch()
     else:
         publish_offer(marker, 3, carrier)
-    with receiver.trace_phase("receiver_scan", {"step": 3}):
+    samples = {}
+    with record_phase(samples, "receiver_scan", {"step": 3}):
         pass
     metadata_reads = []
     lookup_done = []
-    read_offer = modelexpress_trace.read_offer
+    original_read = modelexpress_trace.read_offer
 
     def read_after_lookup(marker, step):
         assert (step_dir / ".receiver_ready").exists() and lookup_done
         metadata_reads.append(step)
-        return read_offer(marker, step)
+        return original_read(marker, step)
 
     monkeypatch.setattr(modelexpress_trace, "read_offer", read_after_lookup)
-    with receiver.trace_phase("confirm_offer", {"step": 3}):
+    with record_phase(samples, "confirm_offer", {"step": 3}):
         assert marker.exists()
-    assert not metadata_reads and not exporter.get_finished_spans()
-    with receiver.trace_update(3):
-        assert not metadata_reads and not exporter.get_finished_spans()
-        with receiver.trace_phase("receiver_ack"):
+    with ReceiverTrace(3, step_dir, "H2D", logger, samples) as receiver:
+        assert receiver.role is None
+        with record_phase(receiver.phases, "receiver_ack"):
             (step_dir / ".receiver_ready").touch()
-        with receiver.trace_phase("wait_version_marker"):
+        with record_phase(receiver.phases, "wait_version_marker"):
             pass
-        with receiver.trace_phase("version_context_lookup"):
+        with record_phase(receiver.phases, "version_context_lookup"):
             lookup_done.append(True)
-        assert not metadata_reads and not exporter.get_finished_spans()
-        receiver.current.uid = "v3"
-        receiver.current.carrier = carrier
-        receiver.trace_accept()
-        receiver.trace_accept()
-        receiver.current.role.set_attributes({"version_uid": "v3", "refit.id": "v3"})
+        assert receiver.role is None and not metadata_reads and not exporter.get_finished_spans()
+        receiver.attach(carrier, "v3")
+        receiver.attach(carrier, "v3")
     assert metadata_reads == [3]
-    assert receiver.current is None and receiver._phases.current.get() is None
 
     async def rollout():
         assert not trace.get_current_span().get_span_context().is_valid
@@ -95,27 +152,19 @@ async def test_receiver_envelope_and_confirmation_do_not_leak_context(refit_trac
     assert all(s.context.trace_id == role.context.trace_id for s in children)
     assert (role.start_time, role.end_time) == (min(s.start_time for s in children), max(s.end_time for s in children))
     assert any(s.name == "mx.refit.receiver_ack" for s in children)
-    confirmation = [s for s in spans if s.name == "mx.refit.confirm_offer"]
-    assert len(confirmation) == 1
-    assert confirmation[0].parent.span_id == role.context.span_id
+    confirmation = next(s for s in spans if s.name == "mx.refit.confirm_offer")
+    assert confirmation.parent.span_id == role.context.span_id
 
 
-@pytest.mark.parametrize(
-    "phase",
-    [
-        "receiver_ack",
-        "wait_version_marker",
-        "version_context_lookup",
-    ],
-)
+@pytest.mark.parametrize("phase", ["receiver_ack", "wait_version_marker", "version_context_lookup"])
 @pytest.mark.parametrize("failure", [RuntimeError("phase failed"), asyncio.CancelledError()])
 def test_early_failure_is_correlated_and_cleans_up(refit_trace, phase, failure):
-    receiver, root, carrier, step_dir, exporter, _ = refit_trace
+    root, carrier, step_dir, exporter, logger, _ = refit_trace
     publish_offer(step_dir / ".sender_ready", 3, carrier)
-    with pytest.raises(type(failure)), receiver.trace_update(3):
-        receiver.current.accepted = True
-        with receiver.trace_phase(phase):
+    with pytest.raises(type(failure)) as raised, ReceiverTrace(3, step_dir, "H2D", logger, {}) as receiver:
+        with record_phase(receiver.phases, phase):
             raise failure
+    assert raised.value is failure and receiver.phases[phase].error is failure
     root.finish()
     spans = exporter.get_finished_spans()
     child = next(s for s in spans if s.name == f"mx.refit.{phase}")
@@ -123,80 +172,60 @@ def test_early_failure_is_correlated_and_cleans_up(refit_trace, phase, failure):
     assert child.context.trace_id == root_span.context.trace_id
     assert child.status.status_code == trace.StatusCode.ERROR and child.events[0].name == "exception"
     assert child.attributes["status"] == ("cancelled" if isinstance(failure, asyncio.CancelledError) else "failed")
-    roles = [s for s in spans if s.name == "mx.refit.orchestrator"]
-    assert len(roles) == 1
-    assert roles[0].status.status_code == trace.StatusCode.ERROR
-    assert child.parent.span_id == roles[0].context.span_id
-    assert receiver.current is None and receiver._phases.current.get() is None
+    role = next(s for s in spans if s.name == "mx.refit.orchestrator")
+    assert role.status.status_code == trace.StatusCode.ERROR
+    assert child.parent.span_id == role.context.span_id
     assert not trace.get_current_span().get_span_context().is_valid
 
 
 @pytest.mark.parametrize("invalid", ["json", "baggage", "trace"])
-def test_invalid_metadata_falls_back_and_confirmation_is_deferred(refit_trace, invalid):
-    receiver, root, carrier, step_dir, exporter, warnings = refit_trace
+def test_invalid_metadata_falls_back_to_version_carrier(refit_trace, invalid):
+    root, carrier, step_dir, exporter, logger, warnings = refit_trace
     marker = step_dir / ".sender_ready"
     if invalid == "json":
         marker.write_text("broken json")
     elif invalid == "baggage":
         publish_offer(marker, 3, {**carrier, "baggage": "step=not-an-integer"})
     else:
-        publish_offer(marker, 3, {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01"})
-    with receiver.trace_update(3):
-        if invalid == "trace":
-            receiver.current.carrier = carrier
-        receiver.trace_accept()
-        assert not receiver.current.offer
-        if invalid != "trace":
-            assert receiver.current.role is None
-        with receiver.trace_phase("receiver_ack"):
+        publish_offer(marker, 3, CARRIER)
+    with ReceiverTrace(3, step_dir, "H2D", logger, {}) as receiver:
+        with record_phase(receiver.phases, "receiver_ack"):
             pass
-        receiver.current.carrier = carrier
-        receiver.trace_accept()
+        receiver.attach(carrier, "v3")
+        assert not receiver.offer and receiver.role is not None
     assert warnings
-    marker.unlink()
-    with receiver.trace_phase("confirm_offer", {"step": 3}):
-        publish_offer(marker, 3, carrier)
-    with receiver.trace_update(3):
-        assert not receiver.current.metadata_read
-        receiver.trace_accept()
-        assert receiver.current.role is not None
     root.finish()
     spans = exporter.get_finished_spans()
-    roles = [s for s in spans if s.name == "mx.refit.orchestrator"]
-    assert len(roles) == 2
+    role = next(s for s in spans if s.name == "mx.refit.orchestrator")
     cycle = next(s for s in spans if s.name == "mx.refit.cycle")
-    assert all(s.context.trace_id == cycle.context.trace_id for s in roles)
-    confirmation = next(s for s in spans if s.name == "mx.refit.confirm_offer")
-    assert confirmation.parent.span_id == roles[1].context.span_id
+    assert role.context.trace_id == cycle.context.trace_id
 
 
 def test_disabled_receiver_does_not_read_metadata_or_emit(refit_trace, monkeypatch):
-    receiver, root, carrier, step_dir, exporter, warnings = refit_trace
+    root, carrier, step_dir, exporter, logger, warnings = refit_trace
     monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
     (step_dir / ".sender_ready").write_text("broken json")
-    with receiver.trace_update(3):
-        receiver.trace_accept()
-        with receiver.trace_phase("receiver_ack"):
+    with ReceiverTrace(3, step_dir, "H2D", logger, {}) as receiver:
+        with record_phase(receiver.phases, "receiver_ack"):
             pass
-        assert receiver.current.role is None
+        receiver.attach(carrier, "v3")
+        assert receiver.role is None and not receiver.phases
     assert not warnings and not exporter.get_finished_spans()
 
 
 def test_failure_without_legacy_carrier_reports_missing_context(refit_trace):
-    receiver, root, carrier, step_dir, exporter, warnings = refit_trace
+    root, carrier, step_dir, exporter, logger, warnings = refit_trace
     (step_dir / ".sender_ready").touch()
-    with pytest.raises(TimeoutError), receiver.trace_update(3):
-        receiver.trace_accept()
-        with receiver.trace_phase("wait_version_marker"):
+    with pytest.raises(TimeoutError), ReceiverTrace(3, step_dir, "H2D", logger, {}) as receiver:
+        with record_phase(receiver.phases, "wait_version_marker"):
             raise TimeoutError("version marker missing")
     assert any("no trace context" in warning for warning in warnings)
     assert not exporter.get_finished_spans()
-    assert receiver.current is None and receiver._phases.current.get() is None
 
 
 @pytest.mark.parametrize("target", ["phase", "role_start", "role_finish"])
 def test_phase_export_failure_preserves_operation_and_original_error(refit_trace, monkeypatch, target):
-    receiver, root, carrier, step_dir, exporter, warnings = refit_trace
+    root, carrier, step_dir, exporter, logger, warnings = refit_trace
     publish_offer(step_dir / ".sender_ready", 3, carrier)
 
     def broken_export(*args, **kwargs):
@@ -222,15 +251,13 @@ def test_phase_export_failure_preserves_operation_and_original_error(refit_trace
 
         monkeypatch.setattr(telemetry, "RefitCycle", cycle_with_broken_finish)
     completed = []
-    with receiver.trace_update(3):
-        receiver.trace_accept()
-        with receiver.trace_phase("receiver_ack"):
+    with ReceiverTrace(3, step_dir, "H2D", logger, {}) as receiver:
+        with record_phase(receiver.phases, "receiver_ack"):
             completed.append("ack")
+        receiver.attach(carrier, "v3")
     failure = ValueError("transfer failed")
-    with pytest.raises(ValueError) as raised, receiver.trace_update(3):
-        receiver.trace_accept()
-        with receiver.trace_phase("version_context_lookup"):
+    with pytest.raises(ValueError) as raised, ReceiverTrace(3, step_dir, "H2D", logger, {}) as receiver:
+        with record_phase(receiver.phases, "version_context_lookup"):
             raise failure
     assert raised.value is failure and completed == ["ack"]
     assert warnings and all("export unavailable" in message for message in warnings)
-    assert receiver.current is None
