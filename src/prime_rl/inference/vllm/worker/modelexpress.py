@@ -7,6 +7,7 @@ import torch
 from modelexpress_rl import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
+    RefitTrace,
     VllmGeneratorContext,
     WeightSource,
     WeightVersionRef,
@@ -39,7 +40,8 @@ class ModelExpressWeightUpdateWorker(Worker):
 
         hf_config = self.model_runner.model_config.hf_config
         chain = get_custom_causal_lm_cls(hf_config).conversion_chain(hf_config)
-        worker_id = f"{session_id}:{rank_offset + self.rank}"
+        self._rank = rank_offset + self.rank
+        worker_id = f"{session_id}:{self._rank}"
         self._generator = ModelExpressGeneratorClient.initialize(
             ModelExpressGeneratorConfig(
                 engine_context=VllmGeneratorContext(
@@ -58,12 +60,14 @@ class ModelExpressWeightUpdateWorker(Worker):
         atexit.register(self._generator.close)
 
     @torch.no_grad()
-    def update_weights_from_modelexpress(self, version_uid: str) -> None:
+    def update_weights_from_modelexpress(self, version_uid: str, trace_context: dict[str, str] | None = None) -> None:
         if not version_uid:
             raise ValueError("modelexpress requires version_uid")
-        version = WeightVersionRef(version_uid)
-        staged = self._generator.stage_weight(version=version)
-        try:
-            self._generator.apply_weight(staged)
-        finally:
-            staged.release()
+        trace = RefitTrace.generator(version_uid=version_uid, rank=self._rank, parent=trace_context)
+        with trace, trace.active():
+            version = WeightVersionRef(version_uid)
+            staged = self._generator.stage_weight(version=version)
+            try:
+                self._generator.apply_weight(staged)
+            finally:
+                staged.release()

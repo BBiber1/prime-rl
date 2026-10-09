@@ -61,7 +61,8 @@ async def update_weights(request: Request):
 @router.post("/update_weights_from_modelexpress")
 async def update_weights_from_modelexpress(request: Request):
     data = await request.json()
-    await engine_client(request).collective_rpc("update_weights_from_modelexpress", args=(data["version_uid"],))
+    carrier = {key: request.headers[key] for key in ("traceparent", "tracestate", "baggage") if key in request.headers}
+    await engine_client(request).collective_rpc("update_weights_from_modelexpress", args=(data["version_uid"], carrier))
     return {"status": "ok"}
 
 

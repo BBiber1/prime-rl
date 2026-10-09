@@ -246,12 +246,14 @@ including the TrainerMesh API from ai-dynamo/modelexpress#835.
 The trainer supplies the model identity from `model.name` when constructing the
 weight sender; it is not a separate field in `[weight_broadcast]`.
 
-The GPU extra includes `modelexpress>=0.7.0`, but the published 0.7.0 package does
-not contain the APIs required by this transport. Install the compatible client
-revision into the same environment:
+This transport requires the ModelExpress Python client from a matching local
+checkout on `bbiber/stage-weight-split-5-telemetry`. The published `modelexpress==0.7.0`
+package does not include the TrainerMesh APIs or the `modelexpress_rl` telemetry
+facade required by this integration. After syncing the PrimeRL environment,
+install the client package from that checkout:
 
 ```bash
-uv pip install "modelexpress @ git+https://github.com/ai-dynamo/modelexpress.git@8512b8c7130db34721a0b2ec57c23198fed3ef4f#subdirectory=modelexpress_client/python"
+uv pip install '/path/to/modelexpress-checkout/modelexpress_client/python[otel]'
 ```
 
 Run PrimeRL with `uv run --no-sync` after this manual installation. Running
@@ -306,6 +308,20 @@ to the other trainer ranks through the distributed process group. Other trainer
 nodes do not need access to that directory for ModelExpress weight updates.
 On failure, rank 0 retains the original exception; other ranks raise an
 installation error without reading the marker or releasing the source version.
+
+Set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to the OTLP HTTP traces endpoint to
+enable tracing, and optionally `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` for metrics.
+PrimeRL adds spans for its filesystem waits and
+markers, version broadcast and trainer barrier, and inference pause, update RPC,
+and resume coordination. The update request uses
+`/update_weights_from_modelexpress` to forward W3C `traceparent`, `tracestate`,
+and `baggage` to generator workers. Trace context is carried with the existing
+version broadcast and retrieved from the published version when the orchestrator
+first discovers its parent. ModelExpress owns the root, trainer/generator groups,
+and per-rank role spans. Enclosing spans measure actual lifetimes, including
+coordination gaps; the root uses service name `root`. ModelExpress's
+`MX_REFIT_TIMING` JSON records and detailed staging and NIXL telemetry remain
+available. Without OTLP endpoints, the tracing scopes are inert.
 
 Use static vLLM admin endpoints. Dynamo discovery, speculative decoding, LoRA
 and SFT online evaluation are not supported by this transport. This adapter

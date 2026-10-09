@@ -4,7 +4,7 @@ import asyncio
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import httpx
 import verifiers.v1 as vf
@@ -24,6 +24,9 @@ from verifiers.v1.configs.client import (
 from prime_rl.configs.algorithm import FrozenModelConfig
 from prime_rl.configs.shared import ClientConfig
 from prime_rl.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from modelexpress_rl import RefitTrace
 
 
 class PrefillScorer:
@@ -210,6 +213,7 @@ class AdminPlane:
         self,
         *,
         version_uid: str,
+        trace: "RefitTrace",
         step: int = 0,
         on_paused: Callable[[], None] | None = None,
     ) -> None:
@@ -217,23 +221,30 @@ class AdminPlane:
         async with self._modelexpress_lock:
             if not version_uid:
                 raise ValueError("modelexpress requires version_uid")
-            await _pause_engines(self.clients, step=step)
-            if on_paused is not None:
-                on_paused()
+            with trace.span("pause_engines"):
+                await _pause_engines(self.clients, step=step)
+                if on_paused is not None:
+                    on_paused()
 
             async def install(client):
                 response = await client.post(
                     "/update_weights_from_modelexpress",
                     json={"version_uid": version_uid},
+                    headers=carrier,
                     timeout=httpx.Timeout(connect=10.0, read=UPDATE_WEIGHTS_TIMEOUT_S, write=60.0, pool=10.0),
                 )
                 response.raise_for_status()
 
-            results = await asyncio.gather(*(install(client) for client in self.clients), return_exceptions=True)
-            for result in results:
-                if isinstance(result, BaseException):
-                    raise result
-            await _resume_engines(self.clients)
+            with trace.generators() as carrier:
+                with trace.span("update_weights_rpc"):
+                    results = await asyncio.gather(
+                        *(install(client) for client in self.clients), return_exceptions=True
+                    )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                with trace.span("resume_engines"):
+                    await _resume_engines(self.clients)
 
     async def initialize_modelexpress(
         self,
